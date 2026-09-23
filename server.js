@@ -42,9 +42,11 @@ Reply in the same language the customer writes in, including the greeting (for R
 
 Product data is fresh from the shop's spreadsheet with every message. Always use it, never rely on earlier messages for prices or stock.
 
-If the customer asks to see a specific item or color, set "image_url" to that exact item's Photo URL from the product data. If that item has no Photo URL, leave "image_url" empty and say you'll send a photo soon. Never guess or reuse another item's photo. Do not put links in "reply".
+Each product object may have a "Photo" field and a "Video" field. These are independent of each other — an item can have a photo, a video, both, or neither, regardless of what the other field contains. Check each one separately; never assume one is empty just because the other is.
 
-If the customer asks for a video of an item, set "video_url" to that exact item's Video URL from the product data. If that item has no Video URL, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
+If the customer asks to see a specific item or color (a photo/picture), look up that exact item's "Photo" field in the product data above and copy its value into "image_url" character-for-character. If that field is empty, leave "image_url" empty and say you'll send a photo soon. Never guess or reuse another item's photo. Do not put links in "reply".
+
+If the customer asks for a video of an item, look up that exact item's "Video" field in the product data above (do not look at "Photo" for this) and copy its value into "video_url" character-for-character. If that field is empty, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
 
 Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>"}
 
@@ -118,6 +120,10 @@ async function askAI(from, userText) {
 
   const allowedVideos = new Set(rows.map((r) => r.Video).filter(Boolean));
   const video = allowedVideos.has(parsed.video_url) ? parsed.video_url : "";
+
+  if (parsed.video_url && !video) {
+    console.log(`AI returned a video_url that isn't in the sheet, dropping it: ${JSON.stringify(parsed.video_url)}`);
+  }
 
   past.push({ role: "user", content: userText }, { role: "assistant", content: reply });
   history.set(from, past.slice(-MAX_HISTORY));
