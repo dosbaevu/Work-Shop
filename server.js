@@ -53,6 +53,11 @@ Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url"
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
 
+QUICK REFERENCE — trust this list over your own reading of the JSON above if they ever seem to disagree:
+- Items that currently HAVE a video available: ${rows.filter((r) => r.Video).map((r) => r.Item).join(", ") || "(none right now)"}
+- Items that currently HAVE a photo available: ${rows.filter((r) => r.Photo).map((r) => r.Item).join(", ") || "(none right now)"}
+Any item not named in a line above does NOT have that media yet — for those, still copy the exact URL from its field once it does.
+
 ${SHOP_INFO}`;
 }
 
