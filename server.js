@@ -171,16 +171,16 @@ async function handleMessage(msg) {
     const t = msg.text.body.trim();
     if (OFF_CMD.test(t)) {
       botEnabled = false;
-      await sendText(from, '🔴 Bot paused — I won\'t reply to customers until you text "bot on". / Бот приостановлен, напишите "bot on", чтобы включить.');
+      await sendText(from, "🔴 Бот приостановлен. Напишите «бот вкл», чтобы снова включить.");
       return;
     }
     if (ON_CMD.test(t)) {
       botEnabled = true;
-      await sendText(from, "🟢 Bot resumed. / Бот снова отвечает клиентам.");
+      await sendText(from, "🟢 Бот снова отвечает клиентам.");
       return;
     }
     if (STATUS_CMD.test(t)) {
-      await sendText(from, botEnabled ? "🟢 Bot is ON." : "🔴 Bot is OFF.");
+      await sendText(from, botEnabled ? "🟢 Бот включён." : "🔴 Бот выключен.");
       return;
     }
   }
@@ -193,7 +193,7 @@ async function handleMessage(msg) {
   if (msg.type !== "text") {
     await sendText(
       from,
-      "Пожалуйста, напишите вопрос текстом. / Please type your question, I can't read voice messages or files yet."
+      "Пожалуйста, напишите вопрос текстом — я пока не понимаю голосовые сообщения и файлы."
     );
     return;
   }
@@ -205,9 +205,7 @@ async function handleMessage(msg) {
     if (video) await sendVideo(from, video);
   } catch (err) {
     console.error("Failed to answer:", err.message);
-    await sendText(from, "Секунду, уточню у владельца и вернусь к вам. / One moment, I'll check with the owner.").catch(
-      () => {}
-    );
+    await sendText(from, "Секунду, уточню у владельца и вернусь к вам.").catch(() => {});
   }
 }
 

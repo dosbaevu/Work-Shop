@@ -132,7 +132,7 @@ async function run() {
   calls.whatsapp.length = 0;
   await handleMessage({ id: "m5", from: "996502282505", type: "audio", audio: { id: "x" } });
   assert.strictEqual(calls.whatsapp.length, 1);
-  assert.ok(/type your question/i.test(calls.whatsapp[0].text.body));
+  assert.ok(/напишите вопрос текстом/i.test(calls.whatsapp[0].text.body));
   console.log("PASS: voice/audio message gets graceful fallback, not silently dropped");
 
   // ---- 8. Malformed OpenAI JSON doesn't crash the handler ----
@@ -146,7 +146,7 @@ async function run() {
   calls.whatsapp.length = 0;
   await handleMessage({ id: "m6", from: "996502282505", type: "text", text: { body: "anything" } });
   assert.strictEqual(calls.whatsapp.length, 1);
-  assert.ok(/check with the owner/i.test(calls.whatsapp[0].text.body));
+  assert.ok(/уточню у владельца/i.test(calls.whatsapp[0].text.body));
   console.log("PASS: malformed AI output falls back to a safe message instead of crashing");
   global.fetch = savedFetch;
 
@@ -186,7 +186,7 @@ async function run() {
   const OWNER = "996700111222";
   await handleMessage({ id: "m9", from: OWNER, type: "text", text: { body: "bot off" } });
   assert.strictEqual(calls.whatsapp.length, 1);
-  assert.ok(/paused/i.test(calls.whatsapp[0].text.body));
+  assert.ok(/приостановлен/i.test(calls.whatsapp[0].text.body));
   console.log("PASS: owner 'bot off' pauses the bot and gets a confirmation");
 
   calls.whatsapp.length = 0;
@@ -197,13 +197,13 @@ async function run() {
   calls.whatsapp.length = 0;
   await handleMessage({ id: "m11", from: OWNER, type: "text", text: { body: "bot status" } });
   assert.strictEqual(calls.whatsapp.length, 1);
-  assert.ok(/OFF/.test(calls.whatsapp[0].text.body));
+  assert.ok(/выключен/i.test(calls.whatsapp[0].text.body));
   console.log("PASS: owner 'bot status' reports the current state");
 
   calls.whatsapp.length = 0;
   await handleMessage({ id: "m12", from: OWNER, type: "text", text: { body: "bot on" } });
   assert.strictEqual(calls.whatsapp.length, 1);
-  assert.ok(/resumed/i.test(calls.whatsapp[0].text.body));
+  assert.ok(/снова отвечает/i.test(calls.whatsapp[0].text.body));
   console.log("PASS: owner 'bot on' resumes the bot and gets a confirmation");
 
   calls.whatsapp.length = 0;
