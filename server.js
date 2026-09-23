@@ -13,6 +13,7 @@ const {
   OPENAI_API_KEY,
   SHEET_ID, // the long ID inside your Google Sheet link
   APP_SECRET, // optional: Meta App Secret, verifies requests really come from Meta
+  OWNER_PHONE, // optional: your own WhatsApp number, lets you pause/resume the bot by texting it
 } = process.env;
 const SHEET_GID = process.env.SHEET_GID || "0";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -43,7 +44,9 @@ Product data is fresh from the shop's spreadsheet with every message. Always use
 
 If the customer asks to see a specific item or color, set "image_url" to that exact item's Photo URL from the product data. If that item has no Photo URL, leave "image_url" empty and say you'll send a photo soon. Never guess or reuse another item's photo. Do not put links in "reply".
 
-Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>"}
+If the customer asks for a video of an item, set "video_url" to that exact item's Video URL from the product data. If that item has no Video URL, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
+
+Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>"}
 
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
@@ -109,14 +112,17 @@ async function askAI(from, userText) {
   }
   const reply = String(parsed.reply || "").trim();
 
-  // Only allow photo links that really exist in the sheet
+  // Only allow photo/video links that really exist in the sheet
   const allowedPhotos = new Set(rows.map((r) => r.Photo).filter(Boolean));
   const image = allowedPhotos.has(parsed.image_url) ? parsed.image_url : "";
+
+  const allowedVideos = new Set(rows.map((r) => r.Video).filter(Boolean));
+  const video = allowedVideos.has(parsed.video_url) ? parsed.video_url : "";
 
   past.push({ role: "user", content: userText }, { role: "assistant", content: reply });
   history.set(from, past.slice(-MAX_HISTORY));
 
-  return { reply, image };
+  return { reply, image, video };
 }
 
 // ---------- WhatsApp sending ----------
@@ -136,6 +142,19 @@ async function sendWhatsApp(payload) {
 
 const sendText = (to, body) => sendWhatsApp({ to, type: "text", text: { body } });
 const sendImage = (to, link) => sendWhatsApp({ to, type: "image", image: { link } });
+const sendVideo = (to, link) => sendWhatsApp({ to, type: "video", video: { link } });
+
+// ---------- Bot Status toggle ----------
+// The owner can pause/resume the AI by texting the shop number from their own phone
+// (set OWNER_PHONE to that number). While paused, customers get no auto-reply at all,
+// so the owner can take over the chat manually from WhatsApp.
+let botEnabled = true;
+const OWNER_ID = String(OWNER_PHONE || "").replace(/\D/g, "");
+const isOwner = (from) => Boolean(OWNER_ID) && String(from).replace(/\D/g, "") === OWNER_ID;
+
+const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s*бот)$/i;
+const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
+const STATUS_CMD = /^(bot\s*status|статус\s*бота)$/i;
 
 // ---------- Handling one incoming message ----------
 const seen = new Set(); // Meta sometimes delivers the same message twice
@@ -147,6 +166,30 @@ async function handleMessage(msg) {
 
   const from = msg.from;
 
+  // Owner-only commands to pause/resume the bot, checked before anything else
+  if (msg.type === "text" && isOwner(from)) {
+    const t = msg.text.body.trim();
+    if (OFF_CMD.test(t)) {
+      botEnabled = false;
+      await sendText(from, '🔴 Bot paused — I won\'t reply to customers until you text "bot on". / Бот приостановлен, напишите "bot on", чтобы включить.');
+      return;
+    }
+    if (ON_CMD.test(t)) {
+      botEnabled = true;
+      await sendText(from, "🟢 Bot resumed. / Бот снова отвечает клиентам.");
+      return;
+    }
+    if (STATUS_CMD.test(t)) {
+      await sendText(from, botEnabled ? "🟢 Bot is ON." : "🔴 Bot is OFF.");
+      return;
+    }
+  }
+
+  if (!botEnabled) {
+    console.log(`Bot is paused, ignoring message from ${from}`);
+    return;
+  }
+
   if (msg.type !== "text") {
     await sendText(
       from,
@@ -156,9 +199,10 @@ async function handleMessage(msg) {
   }
 
   try {
-    const { reply, image } = await askAI(from, msg.text.body);
+    const { reply, image, video } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
+    if (video) await sendVideo(from, video);
   } catch (err) {
     console.error("Failed to answer:", err.message);
     await sendText(from, "Секунду, уточню у владельца и вернусь к вам. / One moment, I'll check with the owner.").catch(
@@ -217,6 +261,7 @@ if (require.main === module) {
     (k) => !process.env[k]
   );
   if (missing.length) console.warn("Missing environment variables:", missing.join(", "));
+  if (!OWNER_PHONE) console.warn("OWNER_PHONE not set — the Bot Status toggle (\"bot off\"/\"bot on\") is disabled.");
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Listening on port ${port}`));
 }
