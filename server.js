@@ -14,6 +14,8 @@ const {
   SHEET_ID, // the long ID inside your Google Sheet link
   APP_SECRET, // optional: Meta App Secret, verifies requests really come from Meta
   OWNER_PHONE, // optional: your own WhatsApp number, lets you pause/resume the bot by texting it
+  UPSTASH_REDIS_REST_URL, // optional: Upstash database URL, lets the bot remember chats for days
+  UPSTASH_REDIS_REST_TOKEN, // optional: Upstash database token (goes with the URL above)
 } = process.env;
 const SHEET_GID = process.env.SHEET_GID || "0";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -41,6 +43,8 @@ function buildSystemPrompt(rows) {
 Reply in the same language the customer writes in, including the greeting (for Russian start with "Здравствуйте" or "Привет", never "Hi"). Translate every word of your reply into the customer's language, including colors, sizes, materials and descriptive words inside product names (e.g. "oversized" becomes "оверсайз" in Russian). When replying in Russian, use no Latin-alphabet words.
 
 Product data is fresh from the shop's spreadsheet with every message. Always use it, never rely on earlier messages for prices or stock.
+
+You may see earlier messages with this customer, sometimes from previous days. Use them to remember what the customer asked about, liked, or ordered, and their size, so they don't have to repeat themselves.
 
 Each product object may have a "Photo" field and a "Video" field. These are independent of each other — an item can have a photo, a video, both, or neither, regardless of what the other field contains. Check each one separately; never assume one is empty just because the other is.
 
@@ -81,13 +85,85 @@ async function fetchCatalog() {
   return rows;
 }
 
-// ---------- OpenAI ----------
-const history = new Map(); // phone number -> last messages (resets if the server restarts)
-const MAX_HISTORY = 10;
+// ---------- Chat memory ----------
+// Each customer's recent messages are saved in an Upstash Redis database so the bot
+// remembers them across days and server restarts. Without Upstash settings it falls
+// back to keeping them in the server's memory only (lost on every restart).
+const MAX_HISTORY = 30; // messages kept per customer (about 15 back-and-forths)
+const HISTORY_DAYS = 30; // a customer's memory is forgotten after this many days of silence
+const NEW_VISIT_HOURS = 3; // a gap longer than this counts as "a new conversation"
+const useRedis = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+const localHistory = new Map(); // fallback, and a backup if the database is briefly unreachable
 
+async function redis(command) {
+  const res = await fetch(UPSTASH_REDIS_REST_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
+    body: JSON.stringify(command),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(`Upstash error ${res.status}: ${data.error || "no details"}`);
+  return data.result;
+}
+
+async function loadHistory(from) {
+  if (useRedis) {
+    try {
+      const raw = await redis(["GET", `chat:${from}`]);
+      return raw ? JSON.parse(raw) : [];
+    } catch (err) {
+      console.error("Could not load chat memory, using local copy:", err.message);
+    }
+  }
+  return localHistory.get(from) || [];
+}
+
+async function saveHistory(from, past) {
+  const trimmed = past.slice(-MAX_HISTORY);
+  localHistory.set(from, trimmed);
+  if (useRedis) {
+    try {
+      await redis(["SET", `chat:${from}`, JSON.stringify(trimmed), "EX", String(HISTORY_DAYS * 86400)]);
+    } catch (err) {
+      console.error("Could not save chat memory:", err.message);
+    }
+  }
+}
+
+const bishkekTime = (ms) =>
+  new Date(ms).toLocaleString("ru-RU", { timeZone: "Asia/Bishkek", dateStyle: "long", timeStyle: "short" });
+
+// Handle one customer's messages one at a time, so quick back-to-back messages
+// don't overwrite each other's memory and replies stay in order.
+const queues = new Map();
+function runInOrder(key, task) {
+  const next = (queues.get(key) || Promise.resolve()).then(task, task);
+  queues.set(key, next);
+  const cleanup = () => {
+    if (queues.get(key) === next) queues.delete(key);
+  };
+  next.then(cleanup, cleanup);
+  return next;
+}
+
+// ---------- OpenAI ----------
 async function askAI(from, userText) {
   const rows = await fetchCatalog();
-  const past = history.get(from) || [];
+  const past = await loadHistory(from);
+
+  // If the customer is coming back after a break, tell the AI so it treats the
+  // earlier messages as a previous conversation (e.g. "yesterday you asked about...").
+  const last = past[past.length - 1];
+  const now = Date.now();
+  const visitNote =
+    last && last.at && now - last.at > NEW_VISIT_HOURS * 3600 * 1000
+      ? [
+          {
+            role: "system",
+            content: `The messages above are from an earlier conversation with this customer (their last message was on ${bishkekTime(last.at)}; it is now ${bishkekTime(now)}, Bishkek time). The customer is writing again now.`,
+          },
+        ]
+      : [];
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -101,7 +177,8 @@ async function askAI(from, userText) {
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: buildSystemPrompt(rows) },
-        ...past,
+        ...past.map(({ role, content }) => ({ role, content })),
+        ...visitNote,
         { role: "user", content: userText },
       ],
     }),
@@ -130,8 +207,8 @@ async function askAI(from, userText) {
     console.log(`AI returned a video_url that isn't in the sheet, dropping it: ${JSON.stringify(parsed.video_url)}`);
   }
 
-  past.push({ role: "user", content: userText }, { role: "assistant", content: reply });
-  history.set(from, past.slice(-MAX_HISTORY));
+  past.push({ role: "user", content: userText, at: now }, { role: "assistant", content: reply, at: Date.now() });
+  await saveHistory(from, past);
 
   return { reply, image, video };
 }
@@ -260,7 +337,9 @@ app.post("/webhook", (req, res) => {
   const changes = (req.body.entry || []).flatMap((e) => e.changes || []);
   for (const change of changes) {
     for (const msg of change.value?.messages || []) {
-      handleMessage(msg).catch((err) => console.error("Handler crashed:", err.message));
+      runInOrder(msg.from, () => handleMessage(msg)).catch((err) =>
+        console.error("Handler crashed:", err.message)
+      );
     }
   }
 });
@@ -271,6 +350,11 @@ if (require.main === module) {
   );
   if (missing.length) console.warn("Missing environment variables:", missing.join(", "));
   if (!OWNER_PHONE) console.warn("OWNER_PHONE not set — the Bot Status toggle (\"bot off\"/\"bot on\") is disabled.");
+  console.log(
+    useRedis
+      ? "Chat memory: saved in Upstash (remembered across days and restarts)."
+      : "Chat memory: UPSTASH_REDIS_REST_URL/TOKEN not set — chats are forgotten on every restart."
+  );
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Listening on port ${port}`));
 }

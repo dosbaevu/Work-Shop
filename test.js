@@ -8,6 +8,8 @@ process.env.OPENAI_API_KEY = "test-openai-key";
 process.env.SHEET_ID = "fake-sheet-id";
 process.env.APP_SECRET = ""; // skip signature check for local test
 process.env.OWNER_PHONE = "996700111222"; // shop owner's own number, for the Bot Status toggle
+process.env.UPSTASH_REDIS_REST_URL = "https://fake-redis.upstash.io";
+process.env.UPSTASH_REDIS_REST_TOKEN = "test-redis-token";
 
 const assert = require("assert");
 const http = require("http");
@@ -20,9 +22,23 @@ Denim jacket (white),"S, M, L",white,1900,all sizes,https://placehold.co/400x600
 
 // ---- Mock global fetch ----
 const calls = { openai: [], whatsapp: [] };
+const redisStore = new Map(); // stands in for the Upstash database; survives a simulated restart
+const redisState = { down: false };
 const originalFetch = global.fetch;
 global.fetch = async (url, opts = {}) => {
   const u = String(url);
+
+  if (u.includes("fake-redis.upstash.io")) {
+    if (redisState.down) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
+    assert.strictEqual(opts.headers.Authorization, "Bearer test-redis-token");
+    const [cmd, key, value] = JSON.parse(opts.body);
+    if (cmd === "GET") return { ok: true, json: async () => ({ result: redisStore.get(key) ?? null }) };
+    if (cmd === "SET") {
+      redisStore.set(key, value);
+      return { ok: true, json: async () => ({ result: "OK" }) };
+    }
+    throw new Error("Unexpected Redis command " + cmd);
+  }
 
   if (u.includes("docs.google.com")) {
     return { ok: true, text: async () => CSV };
@@ -216,6 +232,84 @@ async function run() {
   await handleMessage({ id: "m14", from: "996502282505", type: "text", text: { body: "bot off" } });
   assert.strictEqual(calls.whatsapp.length, 1); // treated as a normal customer question, not a command
   console.log("PASS: 'bot off' from a non-owner number is not treated as a command");
+
+  // ---- 12. Chat memory is saved to the database ----
+  const CUSTOMER = "996555000111";
+  await handleMessage({ id: "m20", from: CUSTOMER, type: "text", text: { body: "У вас есть бежевый пиджак?" } });
+  const saved = JSON.parse(redisStore.get(`chat:${CUSTOMER}`));
+  assert.strictEqual(saved.length, 2);
+  assert.strictEqual(saved[0].content, "У вас есть бежевый пиджак?");
+  assert.strictEqual(saved[1].role, "assistant");
+  assert.ok(saved[0].at > 0);
+  console.log("PASS: conversation is saved to the database with timestamps");
+
+  // ---- 13. Memory survives a server restart ----
+  delete require.cache[require.resolve("./server.js")];
+  const restarted = require("./server.js"); // fresh server: its own in-memory copy is empty
+  calls.openai.length = 0;
+  await restarted.handleMessage({ id: "m21", from: CUSTOMER, type: "text", text: { body: "а сколько он стоит?" } });
+  const sentAfterRestart = calls.openai[0].messages.map((m) => m.content);
+  assert.ok(sentAfterRestart.includes("У вас есть бежевый пиджак?"));
+  assert.ok(!calls.openai[0].messages.some((m) => m.role === "system" && /earlier conversation/.test(m.content)));
+  console.log("PASS: after a restart the bot still sees the earlier messages (no 'new visit' note within 3 hours)");
+
+  // ---- 14. Coming back the next day: AI is told it's an earlier conversation ----
+  const yesterday = Date.now() - 24 * 3600 * 1000;
+  const aged = JSON.parse(redisStore.get(`chat:${CUSTOMER}`)).map((m) => ({ ...m, at: yesterday }));
+  redisStore.set(`chat:${CUSTOMER}`, JSON.stringify(aged));
+  calls.openai.length = 0;
+  await restarted.handleMessage({ id: "m22", from: CUSTOMER, type: "text", text: { body: "Здравствуйте, я вчера спрашивала про пиджак" } });
+  const msgs = calls.openai[0].messages;
+  const note = msgs[msgs.length - 2];
+  assert.strictEqual(note.role, "system");
+  assert.ok(/earlier conversation/.test(note.content));
+  assert.ok(msgs.some((m) => m.content === "У вас есть бежевый пиджак?"));
+  assert.ok(msgs.every((m) => !("at" in m)), "timestamps must not be sent to OpenAI");
+  console.log("PASS: next-day message includes yesterday's chat plus an 'earlier conversation' note");
+
+  // ---- 15. Only the most recent 30 messages are kept ----
+  const long = Array.from({ length: 40 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `old ${i}`, at: Date.now() }));
+  redisStore.set(`chat:${CUSTOMER}`, JSON.stringify(long));
+  await restarted.handleMessage({ id: "m23", from: CUSTOMER, type: "text", text: { body: "ещё вопрос" } });
+  assert.strictEqual(JSON.parse(redisStore.get(`chat:${CUSTOMER}`)).length, 30);
+  console.log("PASS: memory is capped at the last 30 messages");
+
+  // ---- 16. Database outage doesn't stop replies ----
+  redisState.down = true;
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m24", from: CUSTOMER, type: "text", text: { body: "Do you sell shoes?" } });
+  assert.strictEqual(calls.whatsapp.length, 1);
+  assert.ok(/don't carry shoes/i.test(calls.whatsapp[0].text.body));
+  redisState.down = false;
+  console.log("PASS: if the memory database is down, the customer still gets a normal reply");
+
+  // ---- 17. Two quick messages from one customer don't overwrite each other's memory ----
+  const server2 = restarted.app.listen(0);
+  const QUICK = "996555000222";
+  await httpPost(`http://localhost:${server2.address().port}/webhook`, {
+    entry: [
+      {
+        changes: [
+          {
+            value: {
+              messages: [
+                { id: "m30", from: QUICK, type: "text", text: { body: "Здравствуйте" } },
+                { id: "m31", from: QUICK, type: "text", text: { body: "Do you sell shoes?" } },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  const quick = JSON.parse(redisStore.get(`chat:${QUICK}`));
+  assert.deepStrictEqual(
+    quick.map((m) => m.content).filter((_, i) => i % 2 === 0),
+    ["Здравствуйте", "Do you sell shoes?"]
+  );
+  server2.close();
+  console.log("PASS: back-to-back messages are handled in order and both are remembered");
 
   server.close();
   global.fetch = originalFetch;
