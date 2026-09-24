@@ -439,6 +439,19 @@ async function run() {
   assert.ok(/"needs_owner": <true or false>/.test(restarted.buildSystemPrompt([])));
   console.log("PASS: system prompt asks the AI to flag replies that need the owner");
 
+  // ---- 28. ALERT_PHONE sends alerts to a different number; bot on/off stays with OWNER_PHONE ----
+  process.env.ALERT_PHONE = "+996 708 592 194";
+  delete require.cache[require.resolve("./server.js")];
+  const withAlertPhone = require("./server.js");
+  delete process.env.ALERT_PHONE;
+  calls.whatsapp.length = 0;
+  await withAlertPhone.handleMessage({ id: "m70", from: ASKER, type: "text", text: { body: "Будет ли скидка на костюм?" } });
+  assert.deepStrictEqual(calls.whatsapp.map((c) => c.to), [ASKER, "996708592194"]);
+  calls.whatsapp.length = 0;
+  await withAlertPhone.handleMessage({ id: "m71", from: "996700111222", type: "text", text: { body: "статус бота" } });
+  assert.ok(/Бот включён/.test(calls.whatsapp[0].text.body));
+  console.log("PASS: alerts go to ALERT_PHONE (spaces/+ ignored) while bot commands still work from OWNER_PHONE");
+
   server.close();
   global.fetch = originalFetch;
   console.log("\nALL TESTS PASSED");

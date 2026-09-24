@@ -14,6 +14,7 @@ const {
   SHEET_ID, // the long ID inside your Google Sheet link
   APP_SECRET, // optional: Meta App Secret, verifies requests really come from Meta
   OWNER_PHONE, // optional: your own WhatsApp number, lets you pause/resume the bot by texting it
+  ALERT_PHONE, // optional: number(s) that get "a customer needs you" alerts, comma-separated; defaults to OWNER_PHONE
   UPSTASH_REDIS_REST_URL, // optional: Upstash database URL, lets the bot remember chats for days
   UPSTASH_REDIS_REST_TOKEN, // optional: Upstash database token (goes with the URL above)
 } = process.env;
@@ -364,8 +365,13 @@ async function handleMessage(msg) {
 // When the bot can't answer and promises the owner will follow up, text the owner
 // so a customer is never left waiting. Never throws: a failed alert must not
 // affect the customer's reply.
+const ALERT_TO = String(ALERT_PHONE || OWNER_PHONE || "")
+  .split(",")
+  .map((n) => n.replace(/\D/g, ""))
+  .filter(Boolean);
+
 async function notifyOwner(customer, question, botReply, note = "") {
-  if (!OWNER_ID) return;
+  if (!ALERT_TO.length) return;
   const body = [
     "🔔 Клиенту нужен ваш ответ",
     note,
@@ -376,13 +382,15 @@ async function notifyOwner(customer, question, botReply, note = "") {
   ]
     .filter(Boolean)
     .join("\n");
-  try {
-    await sendText(OWNER_ID, body);
-  } catch (err) {
-    console.error(
-      "Could not alert the owner. WhatsApp only lets the shop number message the owner within 24 hours of the owner's last message to it —",
-      err.message
-    );
+  for (const to of ALERT_TO) {
+    try {
+      await sendText(to, body);
+    } catch (err) {
+      console.error(
+        `Could not alert ${to}. That number must have messaged the shop number in the last 24 hours (and, on Meta's test number, be in the allowed recipients list) —`,
+        err.message
+      );
+    }
   }
 }
 
@@ -439,6 +447,7 @@ if (require.main === module) {
   );
   if (missing.length) console.warn("Missing environment variables:", missing.join(", "));
   if (!OWNER_PHONE) console.warn("OWNER_PHONE not set — the Bot Status toggle (\"bot off\"/\"bot on\") is disabled.");
+  console.log(ALERT_TO.length ? `Owner alerts go to: ${ALERT_TO.join(", ")}` : "No ALERT_PHONE/OWNER_PHONE — owner alerts are off.");
   console.log(
     useRedis
       ? "Chat memory: saved in Upstash (remembered across days and restarts)."
