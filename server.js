@@ -40,7 +40,11 @@ Exchange only within 3 days if tags are still attached. No refunds.`;
 function buildSystemPrompt(rows) {
   return `You are the WhatsApp assistant for a small clothing shop. Answer customer questions warmly and briefly, like a real quick chat reply, not a formal essay. Only use the shop information and product data below; if something isn't covered by them, say you'll check with the owner and get back to them rather than guessing. Never infer availability, price, or color from similar products. Never mention that you are an AI.
 
-Reply in the same language the customer writes in, including the greeting (for Russian start with "Здравствуйте" or "Привет", never "Hi"). Translate every word of your reply into the customer's language, including colors, sizes, materials and descriptive words inside product names (e.g. "oversized" becomes "оверсайз" in Russian). When replying in Russian, use no Latin-alphabet words.
+LANGUAGE: Customers write in Russian or Kyrgyz (occasionally English). Always reply in the language of the customer's LATEST message, and switch if they switch.
+- Kyrgyz is a different language from Russian, even though both use Cyrillic. Kyrgyz messages often contain the letters ң, ө, ү or words like салам, саламатсызбы, канча, барбы, бар, жок, рахмат, кандай, эмне, керек, көрсөтүңүз. If the customer writes in Kyrgyz, reply entirely in Kyrgyz and never answer a Kyrgyz message in Russian. Greet with "Саламатсызбы" (or "Салам" if they were casual). In Kyrgyz replies, product names may stay exactly as written in the catalog.
+- If the customer writes in Russian, reply in Russian. Greet with "Здравствуйте" (or "Привет" if they were casual), never "Hi". Translate colors, materials and descriptive words into Russian (e.g. "oversized" becomes "оверсайз").
+- In Russian and Kyrgyz replies use no Latin-alphabet words, except clothing size labels such as S, M, L, XL, which stay as they are.
+- Put the language you replied in into "language": "ky" for Kyrgyz, "ru" for Russian, "en" for English.
 
 Product data is fresh from the shop's spreadsheet with every message. Always use it, never rely on earlier messages for prices or stock.
 
@@ -48,11 +52,13 @@ You may see earlier messages with this customer, sometimes from previous days. U
 
 Each product object may have a "Photo" field and a "Video" field. These are independent of each other — an item can have a photo, a video, both, or neither, regardless of what the other field contains. Check each one separately; never assume one is empty just because the other is.
 
+Only attach a photo or video when the customer's LATEST message asks to see one (e.g. "покажите", "фото", "как выглядит", "сүрөт", "көрсөтүңүз", "show me"). For follow-up questions about price, sizes, stock, colors or delivery, leave "image_url" and "video_url" empty. Your earlier replies in this chat show which photos/videos you already sent; never send the same one again unless the customer asks for it again.
+
 If the customer asks to see a specific item or color (a photo/picture), look up that exact item's "Photo" field in the product data above and copy its value into "image_url" character-for-character. If that field is empty, leave "image_url" empty and say you'll send a photo soon. Never guess or reuse another item's photo. Do not put links in "reply".
 
 If the customer asks for a video of an item, look up that exact item's "Video" field in the product data above (do not look at "Photo" for this) and copy its value into "video_url" character-for-character. If that field is empty, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
 
-Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>"}
+Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>"}
 
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
@@ -146,6 +152,42 @@ function runInOrder(key, task) {
   return next;
 }
 
+// ---------- Customer language (for the few fixed messages the AI doesn't write) ----------
+const LANGS = ["ky", "ru", "en"];
+const FIXED = {
+  notText: {
+    ru: "Пожалуйста, напишите вопрос текстом — я пока не понимаю голосовые сообщения и файлы.",
+    ky: "Сурооңузду текст менен жазып жибериңизчи — азырынча үн билдирүүлөрдү жана файлдарды түшүнө албайм.",
+  },
+  checking: {
+    ru: "Секунду, уточню у владельца и вернусь к вам.",
+    ky: "Бир мүнөт, дүкөндүн ээсинен тактап, сизге кайра жазам.",
+  },
+};
+const KYRGYZ_LETTERS = /[ңөүҢӨҮ]/;
+
+// Kyrgyz if this message has Kyrgyz-only letters, otherwise the language the AI
+// last replied to this customer in, otherwise Russian.
+async function customerLanguage(from, text = "") {
+  if (KYRGYZ_LETTERS.test(text)) return "ky";
+  const past = await loadHistory(from);
+  const lastLang = [...past].reverse().find((m) => m.lang)?.lang;
+  return lastLang === "ky" ? "ky" : "ru";
+}
+
+// Words customers use when they want to see a photo/video (Russian, Kyrgyz, English)
+const ASKS_FOR_MEDIA = /фот|покаж|скин|картин|посмотр|выгляд|видео|сүрөт|көрсөт|photo|pic|show|\bsee\b|video/i;
+
+// Past replies are shown to the AI in the same JSON shape it answers in,
+// so it can see which photos/videos it already sent.
+function toOpenAIMessage(m) {
+  if (m.role !== "assistant") return { role: m.role, content: m.content };
+  return {
+    role: "assistant",
+    content: JSON.stringify({ reply: m.content, image_url: m.image || "", video_url: m.video || "" }),
+  };
+}
+
 // ---------- OpenAI ----------
 async function askAI(from, userText) {
   const rows = await fetchCatalog();
@@ -177,7 +219,7 @@ async function askAI(from, userText) {
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: buildSystemPrompt(rows) },
-        ...past.map(({ role, content }) => ({ role, content })),
+        ...past.map(toOpenAIMessage),
         ...visitNote,
         { role: "user", content: userText },
       ],
@@ -198,19 +240,38 @@ async function askAI(from, userText) {
 
   // Only allow photo/video links that really exist in the sheet
   const allowedPhotos = new Set(rows.map((r) => r.Photo).filter(Boolean));
-  const image = allowedPhotos.has(parsed.image_url) ? parsed.image_url : "";
+  let image = allowedPhotos.has(parsed.image_url) ? parsed.image_url : "";
 
   const allowedVideos = new Set(rows.map((r) => r.Video).filter(Boolean));
-  const video = allowedVideos.has(parsed.video_url) ? parsed.video_url : "";
+  let video = allowedVideos.has(parsed.video_url) ? parsed.video_url : "";
 
   if (parsed.video_url && !video) {
     console.log(`AI returned a video_url that isn't in the sheet, dropping it: ${JSON.stringify(parsed.video_url)}`);
   }
 
-  past.push({ role: "user", content: userText, at: now }, { role: "assistant", content: reply, at: Date.now() });
+  // Don't send the same photo/video again on every follow-up question,
+  // only when the customer actually asks to see it again.
+  if (!ASKS_FOR_MEDIA.test(userText)) {
+    if (image && past.some((m) => m.image === image)) image = "";
+    if (video && past.some((m) => m.video === video)) video = "";
+  }
+
+  const lang = LANGS.includes(parsed.language) ? parsed.language : undefined;
+
+  past.push(
+    { role: "user", content: userText, at: now },
+    {
+      role: "assistant",
+      content: reply,
+      at: Date.now(),
+      ...(lang && { lang }),
+      ...(image && { image }),
+      ...(video && { video }),
+    }
+  );
   await saveHistory(from, past);
 
-  return { reply, image, video };
+  return { reply, image, video, lang };
 }
 
 // ---------- WhatsApp sending ----------
@@ -279,10 +340,7 @@ async function handleMessage(msg) {
   }
 
   if (msg.type !== "text") {
-    await sendText(
-      from,
-      "Пожалуйста, напишите вопрос текстом — я пока не понимаю голосовые сообщения и файлы."
-    );
+    await sendText(from, FIXED.notText[await customerLanguage(from)]);
     return;
   }
 
@@ -293,7 +351,8 @@ async function handleMessage(msg) {
     if (video) await sendVideo(from, video);
   } catch (err) {
     console.error("Failed to answer:", err.message);
-    await sendText(from, "Секунду, уточню у владельца и вернусь к вам.").catch(() => {});
+    const lang = await customerLanguage(from, msg.text.body).catch(() => "ru");
+    await sendText(from, FIXED.checking[lang]).catch(() => {});
   }
 }
 
@@ -359,4 +418,4 @@ if (require.main === module) {
   app.listen(port, () => console.log(`Listening on port ${port}`));
 }
 
-module.exports = { app, handleMessage, buildSystemPrompt };
+module.exports = { app, handleMessage, buildSystemPrompt, ASKS_FOR_MEDIA };

@@ -50,7 +50,9 @@ global.fetch = async (url, opts = {}) => {
     const userMsg = body.messages[body.messages.length - 1].content;
 
     let reply = { reply: "", image_url: "", video_url: "" };
-    if (/video/i.test(userMsg) && /blazer/i.test(userMsg)) {
+    if (/[ңөү]|канча|барбы/i.test(userMsg)) {
+      reply = { reply: "Саламатсызбы! Ооба, бежевый пиджак бар, баасы 2200 сом.", image_url: "", video_url: "", language: "ky" };
+    } else if (/video/i.test(userMsg) && /blazer/i.test(userMsg)) {
       reply = {
         reply: "Here's a video of the beige blazer.",
         image_url: "",
@@ -310,6 +312,87 @@ async function run() {
   );
   server2.close();
   console.log("PASS: back-to-back messages are handled in order and both are remembered");
+
+  // ---- 18. Kyrgyz: prompt tells the AI to answer Kyrgyz in Kyrgyz ----
+  const prompt = restarted.buildSystemPrompt([]);
+  assert.ok(/never answer a Kyrgyz message in Russian/.test(prompt));
+  assert.ok(/"language": "<ky, ru or en>"/.test(prompt));
+  console.log("PASS: system prompt has the Kyrgyz/Russian language rule and asks for the reply language");
+
+  // ---- 19. Kyrgyz reply is sent and the customer's language is remembered ----
+  const KG = "996555000333";
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m40", from: KG, type: "text", text: { body: "Салам, бежевый пиджак барбы? Баасы канча?" } });
+  assert.ok(calls.whatsapp[0].text.body.startsWith("Саламатсызбы"));
+  const kgSaved = JSON.parse(redisStore.get(`chat:${KG}`));
+  assert.strictEqual(kgSaved[1].lang, "ky");
+  console.log("PASS: Kyrgyz question gets the Kyrgyz reply and the language is saved");
+
+  // ---- 20. Voice note from a Kyrgyz-speaking customer gets the Kyrgyz fixed message ----
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m41", from: KG, type: "audio", audio: { id: "x" } });
+  assert.ok(/текст менен жазып/.test(calls.whatsapp[0].text.body));
+  console.log("PASS: voice note from a Kyrgyz speaker gets the 'please type' message in Kyrgyz");
+
+  // ---- 21. Voice note from a brand-new customer defaults to Russian ----
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m42", from: "996555000444", type: "audio", audio: { id: "x" } });
+  assert.ok(/напишите вопрос текстом/.test(calls.whatsapp[0].text.body));
+  console.log("PASS: voice note from a new customer gets the Russian message");
+
+  // ---- 22. If the AI fails on a Kyrgyz message, the fallback is in Kyrgyz ----
+  const beforeBroken = global.fetch;
+  global.fetch = async (url, opts) => {
+    if (String(url).includes("api.openai.com")) {
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "not json {" } }] }) };
+    }
+    return beforeBroken(url, opts);
+  };
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m43", from: "996555000555", type: "text", text: { body: "Көйнөктүн баасы канча?" } });
+  assert.ok(/ээсинен тактап/.test(calls.whatsapp[0].text.body));
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m44", from: "996555000666", type: "text", text: { body: "Сколько стоит платье?" } });
+  assert.ok(/уточню у владельца/.test(calls.whatsapp[0].text.body));
+  global.fetch = beforeBroken;
+  console.log("PASS: error fallback follows the customer's language (Kyrgyz / Russian)");
+
+  // ---- 23. Photo is not re-sent on every follow-up (the AI keeps attaching it) ----
+  const PHOTO_FAN = "996555000777";
+  const BLUE = "https://placehold.co/400x600/1a56db/ffffff?text=Blue+Jacket";
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m50", from: PHOTO_FAN, type: "text", text: { body: "Can I see the blue jacket?" } });
+  assert.deepStrictEqual(calls.whatsapp.map((c) => c.type), ["text", "image"]);
+
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m51", from: PHOTO_FAN, type: "text", text: { body: "What sizes does the blue jacket come in?" } });
+  assert.deepStrictEqual(calls.whatsapp.map((c) => c.type), ["text"]);
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m52", from: PHOTO_FAN, type: "text", text: { body: "And XL for the blue jacket?" } });
+  assert.deepStrictEqual(calls.whatsapp.map((c) => c.type), ["text"]);
+  console.log("PASS: follow-up questions about the same item don't re-send its photo");
+
+  calls.openai.length = 0;
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m53", from: PHOTO_FAN, type: "text", text: { body: "Show me the blue jacket photo again" } });
+  assert.deepStrictEqual(calls.whatsapp.map((c) => c.type), ["text", "image"]);
+  assert.strictEqual(calls.whatsapp[1].image.link, BLUE);
+  console.log("PASS: asking to see it again does re-send the photo");
+
+  // The AI sees its earlier replies in its own JSON format, including the photo it sent
+  const earlier = calls.openai[0].messages.filter((m) => m.role === "assistant").map((m) => JSON.parse(m.content));
+  assert.strictEqual(earlier[0].image_url, BLUE);
+  assert.strictEqual(earlier[1].image_url, "");
+  console.log("PASS: the AI can see which photos it already sent earlier in the chat");
+
+  // Russian/Kyrgyz "show me" words are recognised
+  for (const text of ["покажите фото", "скиньте фотку", "как выглядит?", "сүрөтүн көрсөтүңүзчү"]) {
+    assert.ok(restarted.ASKS_FOR_MEDIA.test(text), text);
+  }
+  for (const text of ["а какие размеры есть", "а XL есть?", "баасы канча?"]) {
+    assert.ok(!restarted.ASKS_FOR_MEDIA.test(text), text);
+  }
+  console.log("PASS: 'show me' words in Russian/Kyrgyz are recognised; size/price questions are not");
 
   server.close();
   global.fetch = originalFetch;
