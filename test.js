@@ -50,7 +50,9 @@ global.fetch = async (url, opts = {}) => {
     const userMsg = body.messages[body.messages.length - 1].content;
 
     let reply = { reply: "", image_url: "", video_url: "" };
-    if (/[ңөү]|канча|барбы/i.test(userMsg)) {
+    if (/are you gay|скидк/i.test(userMsg)) {
+      reply = { reply: "Я уточню у владельца и скоро вернусь с ответом.", image_url: "", video_url: "", language: "ru", needs_owner: true };
+    } else if (/[ңөү]|канча|барбы/i.test(userMsg)) {
       reply = { reply: "Саламатсызбы! Ооба, бежевый пиджак бар, баасы 2200 сом.", image_url: "", video_url: "", language: "ky" };
     } else if (/video/i.test(userMsg) && /blazer/i.test(userMsg)) {
       reply = {
@@ -163,9 +165,12 @@ async function run() {
   };
   calls.whatsapp.length = 0;
   await handleMessage({ id: "m6", from: "996502282505", type: "text", text: { body: "anything" } });
-  assert.strictEqual(calls.whatsapp.length, 1);
+  assert.strictEqual(calls.whatsapp.length, 2);
+  assert.strictEqual(calls.whatsapp[0].to, "996502282505");
   assert.ok(/уточню у владельца/i.test(calls.whatsapp[0].text.body));
-  console.log("PASS: malformed AI output falls back to a safe message instead of crashing");
+  assert.strictEqual(calls.whatsapp[1].to, "996700111222");
+  assert.ok(/не смог ответить/.test(calls.whatsapp[1].text.body));
+  console.log("PASS: malformed AI output falls back to a safe message, and the owner is alerted");
   global.fetch = savedFetch;
 
   // ---- 9. POST /webhook full round trip through Express ----
@@ -393,6 +398,46 @@ async function run() {
     assert.ok(!restarted.ASKS_FOR_MEDIA.test(text), text);
   }
   console.log("PASS: 'show me' words in Russian/Kyrgyz are recognised; size/price questions are not");
+
+  // ---- 24. Bot defers to the owner -> customer gets the reply, owner gets an alert ----
+  const ASKER = "996555000888";
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m60", from: ASKER, type: "text", text: { body: "Будет ли скидка на платье?" } });
+  assert.strictEqual(calls.whatsapp.length, 2);
+  assert.strictEqual(calls.whatsapp[0].to, ASKER); // customer first
+  assert.strictEqual(calls.whatsapp[1].to, "996700111222"); // then the owner
+  const alert = calls.whatsapp[1].text.body;
+  assert.ok(alert.includes("+996555000888"));
+  assert.ok(alert.includes("Будет ли скидка на платье?"));
+  assert.ok(alert.includes("Я уточню у владельца"));
+  assert.ok(alert.includes("https://wa.me/996555000888"));
+  console.log("PASS: when the bot defers, the owner gets an alert with number, question, reply and chat link");
+
+  // ---- 25. Normal answers don't alert the owner ----
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m61", from: ASKER, type: "text", text: { body: "Do you sell shoes?" } });
+  assert.strictEqual(calls.whatsapp.length, 1);
+  assert.strictEqual(calls.whatsapp[0].to, ASKER);
+  console.log("PASS: ordinary answers don't alert the owner");
+
+  // ---- 26. If the alert can't be delivered (owner outside WhatsApp's 24h window), the customer is unaffected ----
+  const beforeOwnerFail = global.fetch;
+  global.fetch = async (url, opts) => {
+    if (String(url).includes("graph.facebook.com") && JSON.parse(opts.body).to === "996700111222") {
+      return { ok: false, status: 400, text: async () => '{"error":{"code":131047,"message":"Re-engagement message"}}' };
+    }
+    return beforeOwnerFail(url, opts);
+  };
+  calls.whatsapp.length = 0;
+  await restarted.handleMessage({ id: "m62", from: ASKER, type: "text", text: { body: "are you gay" } });
+  assert.strictEqual(calls.whatsapp.length, 1); // only the customer's reply, no extra error message
+  assert.ok(/уточню у владельца/.test(calls.whatsapp[0].text.body));
+  global.fetch = beforeOwnerFail;
+  console.log("PASS: a failed owner alert doesn't send the customer an error or crash");
+
+  // ---- 27. Prompt asks the AI to flag when a human is needed ----
+  assert.ok(/"needs_owner": <true or false>/.test(restarted.buildSystemPrompt([])));
+  console.log("PASS: system prompt asks the AI to flag replies that need the owner");
 
   server.close();
   global.fetch = originalFetch;

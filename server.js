@@ -58,7 +58,9 @@ If the customer asks to see a specific item or color (a photo/picture), look up 
 
 If the customer asks for a video of an item, look up that exact item's "Video" field in the product data above (do not look at "Photo" for this) and copy its value into "video_url" character-for-character. If that field is empty, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
 
-Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>"}
+Set "needs_owner" to true whenever your reply says you'll check with the owner, promises to send a photo/video later, or otherwise leaves the customer waiting for a human (questions you can't answer from the shop information and product data, complaints, special requests, or anything off-topic). Otherwise set it to false.
+
+Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>}
 
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
@@ -271,7 +273,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true };
 }
 
 // ---------- WhatsApp sending ----------
@@ -345,14 +347,42 @@ async function handleMessage(msg) {
   }
 
   try {
-    const { reply, image, video } = await askAI(from, msg.text.body);
+    const { reply, image, video, needsOwner } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
+    if (needsOwner) await notifyOwner(from, msg.text.body, reply);
   } catch (err) {
     console.error("Failed to answer:", err.message);
     const lang = await customerLanguage(from, msg.text.body).catch(() => "ru");
     await sendText(from, FIXED.checking[lang]).catch(() => {});
+    await notifyOwner(from, msg.text.body, FIXED.checking[lang], "⚠️ Бот не смог ответить (ошибка).");
+  }
+}
+
+// ---------- Owner alerts ----------
+// When the bot can't answer and promises the owner will follow up, text the owner
+// so a customer is never left waiting. Never throws: a failed alert must not
+// affect the customer's reply.
+async function notifyOwner(customer, question, botReply, note = "") {
+  if (!OWNER_ID) return;
+  const body = [
+    "🔔 Клиенту нужен ваш ответ",
+    note,
+    `Клиент: +${customer}`,
+    `Вопрос: «${question}»`,
+    `Бот ответил: «${botReply}»`,
+    `Написать клиенту: https://wa.me/${customer}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  try {
+    await sendText(OWNER_ID, body);
+  } catch (err) {
+    console.error(
+      "Could not alert the owner. WhatsApp only lets the shop number message the owner within 24 hours of the owner's last message to it —",
+      err.message
+    );
   }
 }
 
