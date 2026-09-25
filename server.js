@@ -352,6 +352,9 @@ async function handleMessage(msg) {
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
+    // TEMP DEBUG: log the AI's needs_owner decision for every message.
+    // Remove this line once we've confirmed alerts are firing as expected.
+    console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
     if (needsOwner) await notifyOwner(from, msg.text.body, reply);
   } catch (err) {
     console.error("Failed to answer:", err.message);
@@ -385,6 +388,8 @@ async function notifyOwner(customer, question, botReply, note = "") {
   for (const to of ALERT_TO) {
     try {
       await sendText(to, body);
+      // TEMP DEBUG: confirm the alert actually made it out successfully.
+      console.log(`Alert sent to ${to} about customer ${customer}`);
     } catch (err) {
       console.error(
         `Could not alert ${to}. That number must have messaged the shop number in the last 24 hours (and, on Meta's test number, be in the allowed recipients list) —`,
