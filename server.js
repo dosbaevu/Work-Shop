@@ -193,6 +193,12 @@ function toOpenAIMessage(m) {
   };
 }
 
+// Words/phrases the bot's own replies use when it's deferring to the owner
+// (Russian, Kyrgyz, English). If the reply text matches this, we alert the
+// owner regardless of what the AI put in "needs_owner" — the model isn't
+// reliable enough about that flag on its own to be the only signal.
+const DEFERS_TO_OWNER = /уточню.*владел|спрош.*владел|владельца.*(уточн|спрош|тактап)|тактап.*ээси|ээсинен тактап|check with the owner|ask the owner|get back to you|i'?ll (find out|confirm) with/i;
+
 // ---------- OpenAI ----------
 async function askAI(from, userText) {
   const rows = await fetchCatalog();
@@ -276,7 +282,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER.test(reply) };
 }
 
 // ---------- WhatsApp sending ----------
