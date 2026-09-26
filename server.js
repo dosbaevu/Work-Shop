@@ -59,6 +59,8 @@ If the customer asks to see a specific item or color (a photo/picture), look up 
 
 If the customer asks for a video of an item, look up that exact item's "Video" field in the product data above (do not look at "Photo" for this) and copy its value into "video_url" character-for-character. If that field is empty, leave "video_url" empty and say you'll send one soon. Never guess or reuse another item's video.
 
+When you need to check with the owner (see below), don't use a fixed template sentence. Phrase it the way a real person quickly texting a customer would — casual, brief, varied each time. For example, instead of always writing "Я уточню у владельца насчет скидки и сообщу вам", mix it up naturally: "Хороший вопрос, спрошу у хозяина и напишу вам", "Дайте уточню у владельца, скоро отвечу", "Сейчас узнаю у хозяина насчёт этого", etc. — same idea, different words each time, like a real shop assistant would text. Always still make clear you're checking with the shop owner and will follow up, just never repeat the exact same sentence twice in one conversation.
+
 Set "needs_owner" to true whenever your reply says you'll check with the owner, promises to send a photo/video later, or otherwise leaves the customer waiting for a human (questions you can't answer from the shop information and product data, complaints, special requests, or anything off-topic). Otherwise set it to false.
 
 CRITICAL, CHECK THIS LAST BEFORE YOU ANSWER: read back your own "reply" text. Does it contain anything like "уточню у владельца", "скоро вернусь с ответом", "спрошу у владельца", "tактап", "I'll check with the owner", "I'll get back to you", "I'll ask the owner", or any other promise that a human will follow up? If yes, "needs_owner" MUST be true — no exceptions, even if you answered a similar question this way earlier in the conversation. Only set "needs_owner" to false when your reply fully answers the question itself, with no promise of a follow-up from anyone.
@@ -193,11 +195,15 @@ function toOpenAIMessage(m) {
   };
 }
 
-// Words/phrases the bot's own replies use when it's deferring to the owner
-// (Russian, Kyrgyz, English). If the reply text matches this, we alert the
-// owner regardless of what the AI put in "needs_owner" — the model isn't
-// reliable enough about that flag on its own to be the only signal.
-const DEFERS_TO_OWNER = /уточню.*владел|спрош.*владел|владельца.*(уточн|спрош|тактап)|тактап.*ээси|ээсинен тактап|check with the owner|ask the owner|get back to you|i'?ll (find out|confirm) with/i;
+// The bot's replies defer to the owner in many different phrasings (we want
+// natural, varied wording, not a fixed template). Rather than match exact
+// sentences, we check for an "owner" word (влад.../хозя.../ээ.../owner)
+// together with a "checking / getting back to you" word nearby in the same
+// reply. This is what actually triggers the alert — not the AI's own
+// "needs_owner" flag, which isn't reliable enough on its own.
+const OWNER_WORD = /влад[её]л|хозя|ээси|ээден|ээге|\bowner\b/i;
+const CHECKING_WORD = /уточн|узна|спрош|поинтерес|свяж|тактап|сообщ|дам знать|вернусь|напишу|напиш|отвеч|check|ask|find out|get back|let you know|confirm/i;
+const DEFERS_TO_OWNER = (text) => OWNER_WORD.test(text) && CHECKING_WORD.test(text);
 
 // ---------- OpenAI ----------
 async function askAI(from, userText) {
@@ -282,7 +288,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER.test(reply) };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply) };
 }
 
 // ---------- WhatsApp sending ----------
