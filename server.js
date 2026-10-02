@@ -335,11 +335,11 @@ const PRICE_CMD_A = /^цена\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на
 const PRICE_CMD_B = /^(.+?)\s+цена\s+(\d+)$/i; // "X цена 2500"
 const QTY_CMD = /^(.+?)\s+(?:саны|количество)\s+(\d+)$/i; // "X саны 3"
 
-async function postToAppsScript(url, payload, hop = 0) {
-  // Google's Apps Script Web Apps answer POST requests with a redirect to a
-  // script.googleusercontent.com URL. Some fetch implementations turn that
-  // redirect into a GET request, silently dropping the POST body (and our
-  // secret). We follow redirects manually, always re-sending as POST.
+async function postToAppsScript(url, payload) {
+  // Apps Script actually RUNS doPost on this first request. The 302 it
+  // returns afterward just points to a separate content-delivery URL
+  // (script.googleusercontent.com) to fetch the already-computed output —
+  // that second URL only accepts GET, so we must not resend our POST body.
   const res = await fetch(url, {
     method: "POST",
     redirect: "manual",
@@ -347,14 +347,15 @@ async function postToAppsScript(url, payload, hop = 0) {
     body: JSON.stringify(payload),
   });
 
-  if ([301, 302, 303, 307, 308].includes(res.status) && hop < 3) {
+  let finalRes = res;
+  if ([301, 302, 303, 307, 308].includes(res.status)) {
     const location = res.headers.get("location");
-    console.log(`Apps Script redirected (${res.status}) to ${location}, following as POST`);
-    if (location) return postToAppsScript(location, payload, hop + 1);
+    console.log(`Apps Script redirected (${res.status}) to fetch output via GET`);
+    if (location) finalRes = await fetch(location, { method: "GET" });
   }
 
-  const text = await res.text();
-  console.log(`Apps Script responded ${res.status}: ${text.slice(0, 300)}`);
+  const text = await finalRes.text();
+  console.log(`Apps Script output ${finalRes.status}: ${text.slice(0, 300)}`);
   try {
     return JSON.parse(text);
   } catch {
