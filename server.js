@@ -17,6 +17,8 @@ const {
   ALERT_PHONE, // optional: number(s) that get "a customer needs you" alerts, comma-separated; defaults to OWNER_PHONE
   UPSTASH_REDIS_REST_URL, // optional: Upstash database URL, lets the bot remember chats for days
   UPSTASH_REDIS_REST_TOKEN, // optional: Upstash database token (goes with the URL above)
+  APPS_SCRIPT_URL, // optional: Google Apps Script Web App URL, lets the owner update the catalog by texting the bot
+  UPDATE_SECRET, // optional: must match the SECRET set inside that Apps Script
 } = process.env;
 const SHEET_GID = process.env.SHEET_GID || "0";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -322,6 +324,59 @@ const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s
 const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
 const STATUS_CMD = /^(bot\s*status|статус\s*бота)$/i;
 
+// Catalog-update commands, texted by the owner. Examples:
+//   "бежевый пиджак продан"        -> marks that item out of stock
+//   "бежевый пиджак в наличии"     -> marks it back in stock
+//   "цена на бежевый пиджак 2500"  -> sets its price
+//   "бежевый пиджак саны 3"        -> sets its quantity
+const SOLD_CMD = /^(.+?)\s+(продан[оа]?|жок)$/i;
+const INSTOCK_CMD = /^(.+?)\s+(в наличии|снова в наличии|бар)$/i;
+const PRICE_CMD_A = /^цена\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на X 2500"
+const PRICE_CMD_B = /^(.+?)\s+цена\s+(\d+)$/i; // "X цена 2500"
+const QTY_CMD = /^(.+?)\s+(?:саны|количество)\s+(\d+)$/i; // "X саны 3"
+
+async function updateCatalog(action, item, value) {
+  if (!APPS_SCRIPT_URL) return { ok: false, error: "not_configured" };
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ secret: UPDATE_SECRET, action, item, value }),
+  });
+  return res.json().catch(() => ({ ok: false, error: "bad_response" }));
+}
+
+function catalogReplyText(result, action) {
+  if (result.ok) {
+    const actionText = { sold: "отмечен как ПРОДАН", instock: "отмечен как В НАЛИЧИИ", price: "цена обновлена", qty: "количество обновлено" }[action];
+    return `✅ «${result.item}» — ${actionText}.`;
+  }
+  if (result.error === "not_found") return "❌ Не нашёл такой товар в каталоге. Проверьте название.";
+  if (result.error === "ambiguous") return `❓ Нашёл несколько похожих товаров, уточните название:\n${result.matches.join("\n")}`;
+  if (result.error === "not_configured") return "⚠️ Обновление каталога через WhatsApp ещё не настроено.";
+  return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
+}
+
+async function tryHandleCatalogCommand(t) {
+  let m;
+  if ((m = SOLD_CMD.exec(t))) {
+    const result = await updateCatalog("sold", m[1].trim());
+    return catalogReplyText(result, "sold");
+  }
+  if ((m = INSTOCK_CMD.exec(t))) {
+    const result = await updateCatalog("instock", m[1].trim());
+    return catalogReplyText(result, "instock");
+  }
+  if ((m = PRICE_CMD_A.exec(t)) || (m = PRICE_CMD_B.exec(t))) {
+    const result = await updateCatalog("price", m[1].trim(), m[2]);
+    return catalogReplyText(result, "price");
+  }
+  if ((m = QTY_CMD.exec(t))) {
+    const result = await updateCatalog("qty", m[1].trim(), m[2]);
+    return catalogReplyText(result, "qty");
+  }
+  return null; // not a catalog command
+}
+
 // ---------- Handling one incoming message ----------
 const seen = new Set(); // Meta sometimes delivers the same message twice
 
@@ -347,6 +402,14 @@ async function handleMessage(msg) {
     }
     if (STATUS_CMD.test(t)) {
       await sendText(from, botEnabled ? "🟢 Бот включён." : "🔴 Бот выключен.");
+      return;
+    }
+    const catalogReply = await tryHandleCatalogCommand(t).catch((err) => {
+      console.error("Catalog update failed:", err.message);
+      return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
+    });
+    if (catalogReply) {
+      await sendText(from, catalogReply);
       return;
     }
   }
