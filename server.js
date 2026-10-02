@@ -335,14 +335,36 @@ const PRICE_CMD_A = /^цена\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на
 const PRICE_CMD_B = /^(.+?)\s+цена\s+(\d+)$/i; // "X цена 2500"
 const QTY_CMD = /^(.+?)\s+(?:саны|количество)\s+(\d+)$/i; // "X саны 3"
 
+async function postToAppsScript(url, payload, hop = 0) {
+  // Google's Apps Script Web Apps answer POST requests with a redirect to a
+  // script.googleusercontent.com URL. Some fetch implementations turn that
+  // redirect into a GET request, silently dropping the POST body (and our
+  // secret). We follow redirects manually, always re-sending as POST.
+  const res = await fetch(url, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if ([301, 302, 303, 307, 308].includes(res.status) && hop < 3) {
+    const location = res.headers.get("location");
+    console.log(`Apps Script redirected (${res.status}) to ${location}, following as POST`);
+    if (location) return postToAppsScript(location, payload, hop + 1);
+  }
+
+  const text = await res.text();
+  console.log(`Apps Script responded ${res.status}: ${text.slice(0, 300)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: false, error: "bad_response", raw: text.slice(0, 200) };
+  }
+}
+
 async function updateCatalog(action, item, value) {
   if (!APPS_SCRIPT_URL) return { ok: false, error: "not_configured" };
-  const res = await fetch(APPS_SCRIPT_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ secret: UPDATE_SECRET, action, item, value }),
-  });
-  return res.json().catch(() => ({ ok: false, error: "bad_response" }));
+  return postToAppsScript(APPS_SCRIPT_URL, { secret: UPDATE_SECRET, action, item, value });
 }
 
 function catalogReplyText(result, action) {
