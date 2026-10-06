@@ -19,6 +19,7 @@ const {
   UPSTASH_REDIS_REST_TOKEN, // optional: Upstash database token (goes with the URL above)
   APPS_SCRIPT_URL, // optional: Google Apps Script Web App URL, lets the owner update the catalog by texting the bot
   UPDATE_SECRET, // optional: must match the SECRET set inside that Apps Script
+  ORDER_ALERT_PHONE, // optional: number(s) that get "new order" alerts, comma-separated; defaults to ALERT_PHONE/OWNER_PHONE
 } = process.env;
 const SHEET_GID = process.env.SHEET_GID || "0";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -409,7 +410,7 @@ async function recordOrder(customer, item, price) {
     `Цена: ${price} сом`,
     `Написать клиенту: https://wa.me/${customer}`,
   ].join("\n");
-  for (const to of ALERT_TO) {
+  for (const to of ORDER_ALERT_TO) {
     try {
       await sendText(to, body);
     } catch (err) {
@@ -523,6 +524,15 @@ const ALERT_TO = String(ALERT_PHONE || OWNER_PHONE || "")
   .split(",")
   .map((n) => n.replace(/\D/g, ""))
   .filter(Boolean);
+
+// New-order alerts can go to a different number than the regular "needs
+// your help" alerts above — defaults to the same list if not set separately.
+const ORDER_ALERT_TO = ORDER_ALERT_PHONE
+  ? String(ORDER_ALERT_PHONE)
+      .split(",")
+      .map((n) => n.replace(/\D/g, ""))
+      .filter(Boolean)
+  : ALERT_TO;
 
 async function notifyOwner(customer, question, botReply, note = "") {
   if (!ALERT_TO.length) return;
