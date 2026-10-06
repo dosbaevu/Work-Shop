@@ -67,7 +67,9 @@ Set "needs_owner" to true whenever your reply says you'll check with the owner, 
 
 CRITICAL, CHECK THIS LAST BEFORE YOU ANSWER: read back your own "reply" text. Does it contain anything like "уточню у владельца", "скоро вернусь с ответом", "спрошу у владельца", "tактап", "I'll check with the owner", "I'll get back to you", "I'll ask the owner", or any other promise that a human will follow up? If yes, "needs_owner" MUST be true — no exceptions, even if you answered a similar question this way earlier in the conversation. Only set "needs_owner" to false when your reply fully answers the question itself, with no promise of a follow-up from anyone.
 
-Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>}
+ORDERS: Set "order" to true only when the customer clearly confirms they want to BUY a specific item right now — phrases like "беру", "заказываю", "хочу купить это", "алам", "беру этот", "I'll take it", "I want to order this". A question about price, size or availability is NOT an order, even if they seem interested — only a clear purchase confirmation counts. When "order" is true, you must be able to tell exactly which single item they mean from the conversation (the item they were just discussing); if it's unclear which item, set "order" to false and ask them to confirm which item instead. When "order" is true, also fill "order_item" (the exact item name, copied character-for-character from the product data's item name field) and "order_price" (the numeric price for that item, as a plain number with no currency symbol). Your "reply" should warmly confirm the order back to the customer. When "order" is false, leave "order_item" and "order_price" as empty strings.
+
+Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>, "order": <true or false>, "order_item": "<exact item name or empty string>", "order_price": <number or empty string>}
 
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
@@ -277,6 +279,22 @@ async function askAI(from, userText) {
 
   const lang = LANGS.includes(parsed.language) ? parsed.language : undefined;
 
+  // Only trust an order if the item name actually exists in the live catalog —
+  // never let the AI invent an order for something that isn't real.
+  let order = false;
+  let orderItem = "";
+  let orderPrice = "";
+  if (parsed.order === true && parsed.order_item) {
+    const matchedRow = rows.find((r) => r["Одежды"] === parsed.order_item);
+    if (matchedRow) {
+      order = true;
+      orderItem = matchedRow["Одежды"];
+      orderPrice = parsed.order_price || matchedRow["Баасы"] || "";
+    } else {
+      console.log(`AI tried to order an item not in the catalog, ignoring: ${JSON.stringify(parsed.order_item)}`);
+    }
+  }
+
   past.push(
     { role: "user", content: userText, at: now },
     {
@@ -290,7 +308,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply) };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply), order, orderItem, orderPrice };
 }
 
 // ---------- WhatsApp sending ----------
@@ -366,6 +384,38 @@ async function postToAppsScript(url, payload) {
 async function updateCatalog(action, item, value) {
   if (!APPS_SCRIPT_URL) return { ok: false, error: "not_configured" };
   return postToAppsScript(APPS_SCRIPT_URL, { secret: UPDATE_SECRET, action, item, value });
+}
+
+// Logs a confirmed order into the Orders sheet tab and alerts the owner —
+// never throws: a failed order log must not affect the customer's reply.
+async function recordOrder(customer, item, price) {
+  try {
+    const result = await postToAppsScript(APPS_SCRIPT_URL, {
+      secret: UPDATE_SECRET,
+      action: "order",
+      customer,
+      item,
+      value: price,
+    });
+    console.log(`Order recorded: ${result.ok ? "ok" : "failed - " + result.error} (${item}, ${customer})`);
+  } catch (err) {
+    console.error("Could not record order:", err.message);
+  }
+
+  const body = [
+    "🛒 Новый заказ!",
+    `Клиент: +${customer}`,
+    `Товар: «${item}»`,
+    `Цена: ${price} сом`,
+    `Написать клиенту: https://wa.me/${customer}`,
+  ].join("\n");
+  for (const to of ALERT_TO) {
+    try {
+      await sendText(to, body);
+    } catch (err) {
+      console.error(`Could not send order alert to ${to}:`, err.message);
+    }
+  }
 }
 
 function catalogReplyText(result, action) {
@@ -448,7 +498,7 @@ async function handleMessage(msg) {
   }
 
   try {
-    const { reply, image, video, needsOwner } = await askAI(from, msg.text.body);
+    const { reply, image, video, needsOwner, order, orderItem, orderPrice } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
@@ -456,6 +506,7 @@ async function handleMessage(msg) {
     // Remove this line once we've confirmed alerts are firing as expected.
     console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
     if (needsOwner) await notifyOwner(from, msg.text.body, reply);
+    if (order) await recordOrder(from, orderItem, orderPrice);
   } catch (err) {
     console.error("Failed to answer:", err.message);
     const lang = await customerLanguage(from, msg.text.body).catch(() => "ru");
