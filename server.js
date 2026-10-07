@@ -506,6 +506,10 @@ async function handleMessage(msg) {
     // TEMP DEBUG: log the AI's needs_owner decision for every message.
     // Remove this line once we've confirmed alerts are firing as expected.
     console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
+    // TEMP DEBUG: log the AI's order decision too, so we can see whether it
+    // detected a purchase confirmation and, if so, whether the item matched
+    // the real catalog. Remove once order alerts are confirmed working.
+    console.log(`order=${order} item=${JSON.stringify(orderItem)} price=${JSON.stringify(orderPrice)} for message from ${from}: "${msg.text.body}"`);
     if (needsOwner) await notifyOwner(from, msg.text.body, reply);
     if (order) await recordOrder(from, orderItem, orderPrice);
   } catch (err) {
