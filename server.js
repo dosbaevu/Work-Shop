@@ -3,6 +3,7 @@
 
 const express = require("express");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const { parse } = require("csv-parse/sync");
 
 // ---------- Settings (set these as Environment Variables on Render) ----------
@@ -84,17 +85,155 @@ QUICK REFERENCE — trust this list over your own reading of the JSON above if t
 - Items that currently HAVE a photo available: ${rows.filter((r) => r.Photo).map((r) => r["Одежды"]).join(", ") || "(none right now)"}
 Any item not named in a line above does NOT have that media yet — for those, still copy the exact URL from its field once it does.
 
-${SHOP_INFO}`;
+${shopInfoText(currentShop())}`;
+}
+
+// The "SHOP INFORMATION" block of the prompt for one shop.
+function shopInfoText(shop) {
+  const info = String(shop.info || "").trim();
+  if (info.toUpperCase().startsWith("SHOP INFORMATION")) return info;
+  return `SHOP INFORMATION:\nShop: ${shop.name}\n\n${info || "No delivery, hours or returns information has been provided. For questions about those, say you'll check with the owner."}`;
+}
+
+// ---------- Shops (one bot, many shops) ----------
+// Shops are listed in the "Shops" tab of the master Google Sheet (the SHEET_ID
+// spreadsheet). Columns: code | name | catalog_gid | orders_gid | owner_phone |
+// alert_phone | info.  catalog_gid / orders_gid are the numbers after "gid=" in the
+// address bar when that tab is open.
+// A customer picks a shop by writing its code in a message (for example from a
+// wa.me link ending in ?text=nur). We remember the choice for that customer.
+// If the Shops tab can't be read, the bot falls back to the single shop described by
+// the environment variables, so nothing breaks.
+const SHOPS_GID = process.env.SHOPS_GID || "577858349";
+const DEFAULT_SHOP_CODE = String(process.env.DEFAULT_SHOP || "").trim().toLowerCase();
+const shopStore = new AsyncLocalStorage(); // "which shop is this message about" follows the code around
+
+const digitsList = (s) =>
+  String(s || "")
+    .split(",")
+    .map((n) => n.replace(/\D/g, ""))
+    .filter(Boolean);
+
+// The single shop described by environment variables (the original setup, and the fallback).
+function envShop() {
+  const alertTo = digitsList(ALERT_PHONE || OWNER_PHONE);
+  return {
+    code: "default",
+    name: "Aiperi Wear",
+    catalogGid: SHEET_GID,
+    ordersGid: "",
+    ownerIds: digitsList(OWNER_PHONE),
+    alertTo,
+    orderAlertTo: ORDER_ALERT_PHONE ? digitsList(ORDER_ALERT_PHONE) : alertTo,
+    info: SHOP_INFO,
+    isDefault: true,
+  };
+}
+
+function rowToShop(r) {
+  const code = String(r.code || "").trim().toLowerCase();
+  if (!code) return null;
+  const ownerIds = digitsList(r.owner_phone);
+  const alerts = digitsList(r.alert_phone);
+  const alertTo = alerts.length ? alerts : ownerIds;
+  return {
+    code,
+    name: String(r.name || code).trim(),
+    catalogGid: String(r.catalog_gid || "").trim() || "0",
+    ordersGid: String(r.orders_gid || "").trim(),
+    ownerIds,
+    alertTo,
+    orderAlertTo: alertTo,
+    info: String(r.info || "").trim(),
+    isDefault: false,
+  };
+}
+
+let shopsCache = { list: null, at: 0 };
+
+async function getShops() {
+  if (shopsCache.list && Date.now() - shopsCache.at < 60000) return shopsCache.list;
+  let list = null;
+  try {
+    const res = await fetch(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHOPS_GID}`);
+    const text = await res.text();
+    if (!res.ok || text.trim().startsWith("<")) throw new Error(`HTTP ${res.status}`);
+    const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+    list = rows.map(rowToShop).filter(Boolean);
+  } catch (err) {
+    console.error("Could not read the Shops tab:", err.message);
+    if (shopsCache.list) {
+      shopsCache.at = Date.now(); // keep using the last good copy for another minute
+      return shopsCache.list;
+    }
+  }
+  if (!list || !list.length) list = [envShop()];
+  // The default shop: the one named in DEFAULT_SHOP, otherwise the first row.
+  const def = list.find((s) => s.code === DEFAULT_SHOP_CODE) || list[0];
+  for (const s of list) s.isDefault = s === def;
+  // The original OWNER_PHONE setting keeps working as an owner of the default shop.
+  def.ownerIds = [...new Set([...def.ownerIds, ...digitsList(OWNER_PHONE)])];
+  shopsCache = { list, at: Date.now() };
+  return list;
+}
+
+const currentShop = () => shopStore.getStore() || envShop();
+const runAsShop = (shop, fn) => shopStore.run(shop, fn);
+
+// Which shop a customer is talking to: a shop code in their message switches it,
+// otherwise the shop they chose before, otherwise the default shop.
+const localCustomerShop = new Map(); // fallback when Redis is off or unreachable
+
+async function savedShopCode(from) {
+  if (useRedis) {
+    try {
+      const code = await redis(["GET", `shop:${from}`]);
+      if (code) return String(code);
+    } catch (err) {
+      console.error("Could not load the customer's shop, using local copy:", err.message);
+    }
+  }
+  return localCustomerShop.get(from) || "";
+}
+
+async function saveShopCode(from, code) {
+  localCustomerShop.set(from, code);
+  if (useRedis) {
+    try {
+      await redis(["SET", `shop:${from}`, code, "EX", String(HISTORY_DAYS * 86400)]);
+    } catch (err) {
+      console.error("Could not save the customer's shop:", err.message);
+    }
+  }
+}
+
+// A shop whose code appears in the text as a whole word (case-insensitive).
+function shopCodeInText(shops, text) {
+  const t = ` ${String(text || "").toLowerCase().replace(/[^\p{L}\p{N}_]+/gu, " ")} `;
+  return shops.find((s) => t.includes(` ${s.code} `)) || null;
+}
+
+async function resolveShopForCustomer(from, text) {
+  const shops = await getShops();
+  const byCode = shopCodeInText(shops, text);
+  if (byCode) {
+    await saveShopCode(from, byCode.code);
+    return byCode;
+  }
+  const saved = await savedShopCode(from);
+  return shops.find((s) => s.code === saved) || shops.find((s) => s.isDefault) || shops[0];
 }
 
 // ---------- Google Sheet (must be shared as "Anyone with the link: Viewer") ----------
-let catalogCache = { rows: null, at: 0 };
+const catalogCaches = new Map(); // catalog tab (gid) -> { rows, at }
 
 async function fetchCatalog() {
-  if (catalogCache.rows && Date.now() - catalogCache.at < 15000) {
-    return catalogCache.rows;
+  const gid = currentShop().catalogGid;
+  const cached = catalogCaches.get(gid);
+  if (cached && cached.rows && Date.now() - cached.at < 15000) {
+    return cached.rows;
   }
-  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`;
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`;
   const res = await fetch(url);
   const text = await res.text();
   if (!res.ok || text.trim().startsWith("<")) {
@@ -103,7 +242,7 @@ async function fetchCatalog() {
     );
   }
   const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
-  catalogCache = { rows, at: Date.now() };
+  catalogCaches.set(gid, { rows, at: Date.now() });
   return rows;
 }
 
@@ -128,24 +267,33 @@ async function redis(command) {
   return data.result;
 }
 
+// A customer has a separate chat memory with each shop. The default shop keeps the
+// original key ("chat:<phone>") so existing memories carry over.
+const historyKey = (from) => {
+  const shop = currentShop();
+  return shop.isDefault ? `chat:${from}` : `chat:${shop.code}:${from}`;
+};
+
 async function loadHistory(from) {
+  const key = historyKey(from);
   if (useRedis) {
     try {
-      const raw = await redis(["GET", `chat:${from}`]);
+      const raw = await redis(["GET", key]);
       return raw ? JSON.parse(raw) : [];
     } catch (err) {
       console.error("Could not load chat memory, using local copy:", err.message);
     }
   }
-  return localHistory.get(from) || [];
+  return localHistory.get(key) || [];
 }
 
 async function saveHistory(from, past) {
+  const key = historyKey(from);
   const trimmed = past.slice(-MAX_HISTORY);
-  localHistory.set(from, trimmed);
+  localHistory.set(key, trimmed);
   if (useRedis) {
     try {
-      await redis(["SET", `chat:${from}`, JSON.stringify(trimmed), "EX", String(HISTORY_DAYS * 86400)]);
+      await redis(["SET", key, JSON.stringify(trimmed), "EX", String(HISTORY_DAYS * 86400)]);
     } catch (err) {
       console.error("Could not save chat memory:", err.message);
     }
@@ -168,14 +316,19 @@ const localStats = new Map(); // day -> { field: count }, fallback when Redis is
 const bishkekDay = (ms = Date.now()) =>
   new Date(ms).toLocaleDateString("en-CA", { timeZone: "Asia/Bishkek" }); // "2026-10-14"
 
+// Each shop has its own counters. The default shop keeps the original key ("stats:<day>").
+const statsKey = (day) => {
+  const shop = currentShop();
+  return shop.isDefault ? `stats:${day}` : `stats:${shop.code}:${day}`;
+};
+
 async function bump(field) {
   try {
-    const day = bishkekDay();
-    const local = localStats.get(day) || {};
+    const key = statsKey(bishkekDay());
+    const local = localStats.get(key) || {};
     local[field] = (local[field] || 0) + 1;
-    localStats.set(day, local);
+    localStats.set(key, local);
     if (useRedis) {
-      const key = `stats:${day}`;
       await redis(["HINCRBY", key, field, "1"]);
       await redis(["EXPIRE", key, String(STATS_DAYS * 86400)]);
     }
@@ -185,9 +338,10 @@ async function bump(field) {
 }
 
 async function loadDay(day) {
+  const key = statsKey(day);
   if (useRedis) {
     try {
-      const raw = await redis(["HGETALL", `stats:${day}`]);
+      const raw = await redis(["HGETALL", key]);
       const out = {};
       if (Array.isArray(raw)) {
         for (let i = 0; i + 1 < raw.length; i += 2) out[raw[i]] = Number(raw[i + 1]) || 0;
@@ -199,7 +353,7 @@ async function loadDay(day) {
       console.error("Could not load stats, using local copy:", err.message);
     }
   }
-  return localStats.get(day) || {};
+  return localStats.get(key) || {};
 }
 
 const sumStats = (list) =>
@@ -489,7 +643,7 @@ const localAlerts = new Map(); // fallback when Redis is off or unreachable
 
 async function rememberAlert(wamid, customer, question) {
   if (!wamid) return;
-  const value = { customer, question };
+  const value = { customer, question, shop: currentShop().code }; // the shop is needed to answer in the right chat
   localAlerts.set(wamid, value);
   if (localAlerts.size > 500) localAlerts.delete(localAlerts.keys().next().value);
   if (useRedis) {
@@ -569,11 +723,24 @@ function relayOwnerReply(alert, ownerText) {
 
 // ---------- Bot Status toggle ----------
 // The owner can pause/resume the AI by texting the shop number from their own phone
-// (set OWNER_PHONE to that number). While paused, customers get no auto-reply at all,
-// so the owner can take over the chat manually from WhatsApp.
-let botEnabled = true;
-const OWNER_ID = String(OWNER_PHONE || "").replace(/\D/g, "");
-const isOwner = (from) => Boolean(OWNER_ID) && String(from).replace(/\D/g, "") === OWNER_ID;
+// (the shop's owner_phone). While a shop is paused, its customers get no auto-reply
+// at all, so the owner can take over the chat manually from WhatsApp.
+const pausedShops = new Set(); // codes of shops whose bot is paused
+
+// If this sender is an owner: which shop their message is about, and the command text.
+// An owner of several shops can start a command with a shop code ("nur: статистика");
+// without a code, the first shop they own is used.
+async function ownerContext(from, text) {
+  const id = String(from).replace(/\D/g, "");
+  const owned = (await getShops()).filter((s) => s.ownerIds.includes(id));
+  if (!owned.length) return null;
+  const m = /^([\p{L}\p{N}_]+)\s*[:：]\s*([\s\S]+)$/u.exec(text);
+  if (m) {
+    const picked = owned.find((s) => s.code === m[1].toLowerCase());
+    if (picked) return { shop: picked, text: m[2].trim(), many: owned.length > 1 };
+  }
+  return { shop: owned[0], text, many: owned.length > 1 };
+}
 
 const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s*бот)$/i;
 const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
@@ -621,9 +788,12 @@ async function postToAppsScript(url, payload) {
   }
 }
 
+// Which tabs of the master spreadsheet the Apps Script should write to for this shop.
+const sheetTabs = () => ({ catalog_gid: currentShop().catalogGid, orders_gid: currentShop().ordersGid });
+
 async function updateCatalog(action, item, value) {
   if (!APPS_SCRIPT_URL) return { ok: false, error: "not_configured" };
-  return postToAppsScript(APPS_SCRIPT_URL, { secret: UPDATE_SECRET, action, item, value });
+  return postToAppsScript(APPS_SCRIPT_URL, { secret: UPDATE_SECRET, action, item, value, ...sheetTabs() });
 }
 
 // Logs a confirmed order into the Orders sheet tab and alerts the owner —
@@ -636,6 +806,7 @@ async function recordOrder(customer, item, price) {
       customer,
       item,
       value: price,
+      ...sheetTabs(),
     });
     console.log(`Order recorded: ${result.ok ? "ok" : "failed - " + result.error} (${item}, ${customer})`);
   } catch (err) {
@@ -646,6 +817,7 @@ async function recordOrder(customer, item, price) {
   const left = await decreaseStock(item);
 
   const body = [
+    shopLine(),
     "🛒 Новый заказ!",
     `Клиент: +${customer}`,
     `Товар: «${item}»`,
@@ -655,7 +827,7 @@ async function recordOrder(customer, item, price) {
       : [left === 0 ? "📦 Осталось: 0 шт. — товар закончился!" : `📦 Осталось: ${left} шт.${left <= LOW_STOCK_THRESHOLD ? " ⚠️ заканчивается" : ""}`]),
     `Написать клиенту: https://wa.me/${customer}`,
   ].join("\n");
-  for (const to of ORDER_ALERT_TO) {
+  for (const to of currentShop().orderAlertTo) {
     try {
       await sendText(to, body);
     } catch (err) {
@@ -664,10 +836,14 @@ async function recordOrder(customer, item, price) {
   }
 }
 
+// First line of every message to an owner, so an owner of several shops sees which one it is about.
+const shopLine = () => `🏪 ${currentShop().name}`;
+
 // A customer is upset or angry: send an urgent alert (to the same numbers as the
 // regular "needs you" alerts) so the owner steps in quickly. Never throws.
 async function notifyUpsetCustomer(customer, message, botReply, mood) {
   const body = [
+    shopLine(),
     mood === "angry" ? "🚨 Злой клиент, ответьте как можно скорее!" : "😟 Недовольный клиент, лучше ответить быстро",
     `Клиент: +${customer}`,
     `Сообщение: «${message}»`,
@@ -675,7 +851,7 @@ async function notifyUpsetCustomer(customer, message, botReply, mood) {
     `Написать клиенту: https://wa.me/${customer}`,
     "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
   ].join("\n");
-  for (const to of ALERT_TO) {
+  for (const to of currentShop().alertTo) {
     try {
       const wamid = await sendText(to, body);
       await rememberAlert(wamid, customer, message);
@@ -700,7 +876,7 @@ async function decreaseStock(item) {
       console.error(`Could not lower stock for ${JSON.stringify(item)}: ${result.error}`);
       return null;
     }
-    catalogCache = { rows: null, at: 0 }; // the next message reads the new quantity
+    catalogCaches.delete(currentShop().catalogGid); // the next message reads the new quantity
     console.log(`Stock for ${JSON.stringify(item)}: ${raw} -> ${left}`);
     return left;
   } catch (err) {
@@ -714,6 +890,7 @@ async function decreaseStock(item) {
 // anyway so a real purchase is never missed. Never throws.
 async function notifyPossibleOrder(customer, message, botReply) {
   const body = [
+    shopLine(),
     "🛒 Похоже, клиент хочет заказать",
     "(бот не смог точно определить товар, поэтому в таблицу заказ не записан. Проверьте переписку.)",
     `Клиент: +${customer}`,
@@ -722,7 +899,7 @@ async function notifyPossibleOrder(customer, message, botReply) {
     `Написать клиенту: https://wa.me/${customer}`,
     "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
   ].join("\n");
-  for (const to of ORDER_ALERT_TO) {
+  for (const to of currentShop().orderAlertTo) {
     try {
       const wamid = await sendText(to, body);
       await rememberAlert(wamid, customer, message);
@@ -770,24 +947,21 @@ async function tryHandleCatalogCommand(t) {
 // ---------- Handling one incoming message ----------
 const seen = new Set(); // Meta sometimes delivers the same message twice
 
-async function handleMessage(msg) {
-  if (seen.has(msg.id)) return;
-  seen.add(msg.id);
-  if (seen.size > 2000) seen.delete(seen.values().next().value);
-
+// An owner texted the shop number. Returns true if the message was an owner command
+// or an answer to an alert (so it must not be treated as a customer message).
+async function handleOwnerMessage(msg, owner) {
   const from = msg.from;
+  const rawText = msg.text.body.trim();
 
-  // Owner-only commands to pause/resume the bot, checked before anything else
-  if (msg.type === "text" && isOwner(from)) {
-    const t = msg.text.body.trim();
-
-    // The owner swipe-replied to a "🔔 customer needs you" alert: pass the answer on.
-    const quotedId = msg.context?.id;
-    if (quotedId) {
-      const alert = await lookupAlert(quotedId);
-      if (alert) {
+  // The owner swipe-replied to an alert ("🔔 customer needs you" etc.): pass the answer on.
+  const quotedId = msg.context?.id;
+  if (quotedId) {
+    const alert = await lookupAlert(quotedId);
+    if (alert) {
+      const alertShop = (await getShops()).find((s) => s.code === alert.shop) || owner.shop;
+      await runAsShop(alertShop, async () => {
         try {
-          const sent = await relayOwnerReply(alert, t);
+          const sent = await relayOwnerReply(alert, rawText);
           await sendText(from, `✅ Отправил клиенту +${alert.customer}:\n«${sent}»`);
         } catch (err) {
           console.error("Could not pass the owner's answer to the customer:", err.message);
@@ -796,52 +970,82 @@ async function handleMessage(msg) {
             `⚠️ Не удалось отправить клиенту. Возможно, прошло больше 24 часов с его последнего сообщения. Напишите ему напрямую: https://wa.me/${alert.customer}`
           ).catch(() => {});
         }
-        return;
-      }
+      });
+      return true;
     }
+  }
+
+  return runAsShop(owner.shop, async () => {
+    const t = owner.text;
+    // An owner of several shops sees which shop each reply is about.
+    const say = (text) => sendText(from, owner.many ? `🏪 ${owner.shop.name}\n${text}` : text);
+    const code = owner.shop.code;
 
     if (OFF_CMD.test(t)) {
-      botEnabled = false;
-      await sendText(from, "🔴 Бот приостановлен. Напишите «бот вкл», чтобы снова включить.");
-      return;
+      pausedShops.add(code);
+      await say("🔴 Бот приостановлен. Напишите «бот вкл», чтобы снова включить.");
+      return true;
     }
     if (ON_CMD.test(t)) {
-      botEnabled = true;
-      await sendText(from, "🟢 Бот снова отвечает клиентам.");
-      return;
+      pausedShops.delete(code);
+      await say("🟢 Бот снова отвечает клиентам.");
+      return true;
     }
     if (STATUS_CMD.test(t)) {
-      await sendText(from, botEnabled ? "🟢 Бот включён." : "🔴 Бот выключен.");
-      return;
+      await say(pausedShops.has(code) ? "🔴 Бот выключен." : "🟢 Бот включён.");
+      return true;
     }
     if (STATS_CMD.test(t)) {
       const report = await buildStatsReport().catch((err) => {
         console.error("Stats report failed:", err.message);
         return "⚠️ Не удалось собрать статистику, попробуйте ещё раз.";
       });
-      await sendText(from, report);
-      return;
+      await say(report);
+      return true;
     }
     if (LOWSTOCK_CMD.test(t)) {
       const { text } = await lowStockReport().catch((err) => {
         console.error("Low stock report failed:", err.message);
         return { text: "⚠️ Не удалось проверить остатки, попробуйте ещё раз." };
       });
-      await sendText(from, text);
-      return;
+      await say(text);
+      return true;
     }
     const catalogReply = await tryHandleCatalogCommand(t).catch((err) => {
       console.error("Catalog update failed:", err.message);
       return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
     });
     if (catalogReply) {
-      await sendText(from, catalogReply);
-      return;
+      await say(catalogReply);
+      return true;
     }
+    return false;
+  });
+}
+
+async function handleMessage(msg) {
+  if (seen.has(msg.id)) return;
+  seen.add(msg.id);
+  if (seen.size > 2000) seen.delete(seen.values().next().value);
+
+  const from = msg.from;
+
+  // Owner-only commands and answers to alerts come first
+  if (msg.type === "text") {
+    const owner = await ownerContext(from, msg.text.body.trim());
+    if (owner && (await handleOwnerMessage(msg, owner))) return;
   }
 
-  if (!botEnabled) {
-    console.log(`Bot is paused, ignoring message from ${from}`);
+  // Everything else is a customer: find out which shop they are talking to
+  const shop = await resolveShopForCustomer(from, msg.type === "text" ? msg.text.body : "");
+  return runAsShop(shop, () => handleCustomerMessage(msg, shop));
+}
+
+async function handleCustomerMessage(msg, shop) {
+  const from = msg.from;
+
+  if (pausedShops.has(shop.code)) {
+    console.log(`Bot is paused for ${shop.code}, ignoring message from ${from}`);
     return;
   }
 
@@ -861,12 +1065,8 @@ async function handleMessage(msg) {
     await bump(needsOwner ? "escalated" : "answered");
     if (order) await bump("orders");
     if (mood !== "calm") await bump("complaints");
-    // TEMP DEBUG: log the AI's needs_owner decision for every message.
-    // Remove this line once we've confirmed alerts are firing as expected.
-    console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
-    // TEMP DEBUG: log the AI's order decision too, so we can see whether it
-    // detected a purchase confirmation and, if so, whether the item matched
-    // the real catalog. Remove once order alerts are confirmed working.
+    // TEMP DEBUG: log the AI's decisions for every message (shop, needs_owner, order, mood).
+    console.log(`shop=${shop.code} needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
     console.log(`order=${order} item=${JSON.stringify(orderItem)} price=${JSON.stringify(orderPrice)} for message from ${from}: "${msg.text.body}"`);
     console.log(`mood=${mood} for message from ${from}`);
     // An upset or angry customer gets the urgent alert instead of the regular one (never both)
@@ -887,24 +1087,14 @@ async function handleMessage(msg) {
 // ---------- Owner alerts ----------
 // When the bot can't answer and promises the owner will follow up, text the owner
 // so a customer is never left waiting. Never throws: a failed alert must not
-// affect the customer's reply.
-const ALERT_TO = String(ALERT_PHONE || OWNER_PHONE || "")
-  .split(",")
-  .map((n) => n.replace(/\D/g, ""))
-  .filter(Boolean);
-
-// New-order alerts can go to a different number than the regular "needs
-// your help" alerts above — defaults to the same list if not set separately.
-const ORDER_ALERT_TO = ORDER_ALERT_PHONE
-  ? String(ORDER_ALERT_PHONE)
-      .split(",")
-      .map((n) => n.replace(/\D/g, ""))
-      .filter(Boolean)
-  : ALERT_TO;
+// affect the customer's reply. Each shop has its own alert numbers: alertTo for
+// "needs you" alerts, orderAlertTo for new orders.
 
 async function notifyOwner(customer, question, botReply, note = "") {
-  if (!ALERT_TO.length) return;
+  const shop = currentShop();
+  if (!shop.alertTo.length) return;
   const body = [
+    shopLine(),
     "🔔 Клиенту нужен ваш ответ",
     note,
     `Клиент: +${customer}`,
@@ -915,12 +1105,11 @@ async function notifyOwner(customer, question, botReply, note = "") {
   ]
     .filter(Boolean)
     .join("\n");
-  for (const to of ALERT_TO) {
+  for (const to of shop.alertTo) {
     try {
       const wamid = await sendText(to, body);
       await rememberAlert(wamid, customer, question);
-      // TEMP DEBUG: confirm the alert actually made it out successfully.
-      console.log(`Alert sent to ${to} about customer ${customer}`);
+      console.log(`Alert sent to ${to} about customer ${customer} (${shop.code})`);
     } catch (err) {
       console.error(
         `Could not alert ${to}. That number must have messaged the shop number in the last 24 hours (and, on Meta's test number, be in the allowed recipients list) —`,
@@ -934,7 +1123,7 @@ async function notifyOwner(customer, question, botReply, note = "") {
 // Items whose quantity ("Саны" column) is at or below this number count as running low.
 const LOW_STOCK_THRESHOLD = Number(process.env.LOW_STOCK_THRESHOLD) || 2;
 
-// Returns { text, count }. count is 0 when everything is well stocked.
+// Returns { text, count } for the current shop. count is 0 when everything is well stocked.
 async function lowStockReport() {
   const rows = await fetchCatalog();
   const low = rows
@@ -946,9 +1135,9 @@ async function lowStockReport() {
   return { text: `📦 Заканчивается товар (${LOW_STOCK_THRESHOLD} шт. и меньше):\n\n${lines.join("\n")}`, count: low.length };
 }
 
-// Text every owner/alert number. Never throws.
+// Text every alert number of the current shop. Never throws.
 async function alertOwners(text) {
-  for (const to of ALERT_TO) {
+  for (const to of currentShop().alertTo) {
     try {
       await sendText(to, text);
       console.log(`Scheduled message sent to ${to}`);
@@ -958,17 +1147,28 @@ async function alertOwners(text) {
   }
 }
 
+// Runs one scheduled task ("lowstock" or "summary") for every shop, each in its own shop context.
 async function runScheduledTask(task) {
-  if (task === "lowstock") {
-    const { text, count } = await lowStockReport();
-    if (count) await alertOwners(text); // stay quiet when there is nothing to report
-    console.log(`Scheduled lowstock: ${count} item(s) low`);
-  } else if (task === "summary") {
-    const today = await loadDay(bishkekDay());
-    await alertOwners(`🌙 Итоги дня\n\n${statsBlock(today)}`);
-    console.log("Scheduled summary sent");
-  } else {
+  if (task !== "lowstock" && task !== "summary") {
     console.warn(`Unknown scheduled task: ${task}`);
+    return;
+  }
+  for (const shop of await getShops()) {
+    await runAsShop(shop, async () => {
+      try {
+        if (task === "lowstock") {
+          const { text, count } = await lowStockReport();
+          if (count) await alertOwners(`${shopLine()}\n${text}`); // stay quiet when there is nothing to report
+          console.log(`Scheduled lowstock for ${shop.code}: ${count} item(s) low`);
+        } else {
+          const today = await loadDay(bishkekDay());
+          await alertOwners(`${shopLine()}\n🌙 Итоги дня\n\n${statsBlock(today)}`);
+          console.log(`Scheduled summary sent for ${shop.code}`);
+        }
+      } catch (err) {
+        console.error(`Scheduled ${task} failed for ${shop.code}:`, err.message);
+      }
+    });
   }
 }
 
@@ -1036,7 +1236,11 @@ if (require.main === module) {
   );
   if (missing.length) console.warn("Missing environment variables:", missing.join(", "));
   if (!OWNER_PHONE) console.warn("OWNER_PHONE not set — the Bot Status toggle (\"bot off\"/\"bot on\") is disabled.");
-  console.log(ALERT_TO.length ? `Owner alerts go to: ${ALERT_TO.join(", ")}` : "No ALERT_PHONE/OWNER_PHONE — owner alerts are off.");
+  getShops()
+    .then((shops) =>
+      console.log(`Shops: ${shops.map((x) => `${x.code}${x.isDefault ? " (default)" : ""} alerts to ${x.alertTo.join(",") || "nobody"}`).join("; ")}`)
+    )
+    .catch((err) => console.error("Could not load shops at startup:", err.message));
   console.log(
     useRedis
       ? "Chat memory: saved in Upstash (remembered across days and restarts)."
