@@ -63,7 +63,7 @@ LANGUAGE: Customers write in Russian, Kyrgyz or English. Always reply in the lan
 - If the customer writes in English, reply entirely in English, with no Russian or Kyrgyz words. Greet with "Hello" or "Hi". Translate the catalog's item names, colors and descriptions into natural English (for example "Зыгыр жейде — ак" becomes "white linen shirt"). The only exception is "order_item", which must still be copied exactly from the catalog.
 - Kyrgyz is a different language from Russian, even though both use Cyrillic. Kyrgyz messages often contain the letters ң, ө, ү or words like салам, саламатсызбы, канча, барбы, бар, жок, рахмат, кандай, эмне, керек, көрсөтүңүз. If the customer writes in Kyrgyz, reply entirely in Kyrgyz and never answer a Kyrgyz message in Russian. Greet with "Саламатсызбы" (or "Салам" if they were casual). In Kyrgyz replies, product names may stay exactly as written in the catalog.
 - If the customer writes in Russian, reply in Russian. Greet with "Здравствуйте" (or "Привет" if they were casual), never "Hi". The catalog is written in Kyrgyz, so translate item names, colors, materials and descriptive words into natural Russian (e.g. "oversized" becomes "оверсайз").
-- In Russian and Kyrgyz replies use no Latin-alphabet words, except clothing size labels such as S, M, L, XL, which stay as they are.
+- In Russian and Kyrgyz replies use no Latin-alphabet words, except clothing size labels such as S, M, L, XL and brand or model names (Adidas, Li-Ning, Campus, Forum Low, Spezial, VL Court), which stay as they are in the catalog.
 - Put the language you replied in into "language": "ky" for Kyrgyz, "ru" for Russian, "en" for English.
 
 Product data is fresh from the shop's spreadsheet with every message. Always use it, never rely on earlier messages for prices or stock.
@@ -801,7 +801,7 @@ async function composeOwnerReply(customer, question, ownerText) {
           role: "system",
           content: `You write one WhatsApp message to a customer of a small clothing shop, speaking as the shop, on behalf of the shop owner.
 The owner gave you their answer in their own words. Turn it into a short, warm, natural chat message that says exactly what the owner said. Do not add facts, prices, times or promises the owner did not state, and do not leave out anything they said.
-Reply in the same language as the customer's question (Russian, Kyrgyz or English). In Russian and Kyrgyz use no Latin-alphabet words, except clothing size labels such as S, M, L, XL.
+Reply in the same language as the customer's question (Russian, Kyrgyz or English). In Russian and Kyrgyz use no Latin-alphabet words, except clothing size labels such as S, M, L, XL and brand or model names.
 Never mention AI, a bot, or that the owner passed on a note: just speak as the shop.
 Answer ONLY with a JSON object: {"reply": "<message for the customer>", "language": "<ky, ru or en>"}`,
         },
