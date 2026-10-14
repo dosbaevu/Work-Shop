@@ -309,6 +309,20 @@ const normName = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
+// Looks through texts (newest first) for a catalog item name and returns the row of
+// the first text that has one (the longest name wins if several appear in it).
+function lastMentionedItem(rows, texts) {
+  for (const text of texts) {
+    const t = normName(text);
+    if (!t) continue;
+    const hits = rows
+      .filter((r) => normName(r["Одежды"]) && t.includes(normName(r["Одежды"])))
+      .sort((a, b) => normName(b["Одежды"]).length - normName(a["Одежды"]).length);
+    if (hits.length) return hits[0];
+  }
+  return null;
+}
+
 // ---------- OpenAI ----------
 async function askAI(from, userText) {
   const rows = await fetchCatalog();
@@ -399,9 +413,21 @@ async function askAI(from, userText) {
   }
 
   // Safety net: the AI's own "order" flag isn't fully reliable. If its reply
-  // confirms an order but no valid catalog item was recorded, flag a POSSIBLE
-  // order so the owner still gets an alert (the owner then checks it by hand).
-  const orderUncertain = !order && !reply.includes("?") && ORDER_CONFIRMED.test(reply);
+  // confirms an order (and isn't a question) but no valid item was recorded, work
+  // out the item from the conversation: the catalog item mentioned most recently.
+  const replyConfirmsOrder = !reply.includes("?") && ORDER_CONFIRMED.test(reply);
+  if (!order && replyConfirmsOrder) {
+    const recentTexts = [reply, userText, ...[...past].reverse().map((m) => m.content)].slice(0, 8);
+    const row = lastMentionedItem(rows, recentTexts);
+    if (row) {
+      order = true;
+      orderItem = row["Одежды"];
+      orderPrice = row["Баасы"] || "";
+      console.log(`Order item recovered from the conversation: ${JSON.stringify(orderItem)}`);
+    }
+  }
+  // Still no idea which item? Flag a POSSIBLE order so the owner gets an alert anyway.
+  const orderUncertain = !order && replyConfirmsOrder;
 
   past.push(
     { role: "user", content: userText, at: now },
@@ -603,11 +629,17 @@ async function recordOrder(customer, item, price) {
     console.error("Could not record order:", err.message);
   }
 
+  // Take one piece off this item's stock ("Саны"); never goes below 0.
+  const left = await decreaseStock(item);
+
   const body = [
     "🛒 Новый заказ!",
     `Клиент: +${customer}`,
     `Товар: «${item}»`,
     `Цена: ${price} сом`,
+    ...(left === null
+      ? []
+      : [left === 0 ? "📦 Осталось: 0 шт. — товар закончился!" : `📦 Осталось: ${left} шт.${left <= LOW_STOCK_THRESHOLD ? " ⚠️ заканчивается" : ""}`]),
     `Написать клиенту: https://wa.me/${customer}`,
   ].join("\n");
   for (const to of ORDER_ALERT_TO) {
@@ -616,6 +648,29 @@ async function recordOrder(customer, item, price) {
     } catch (err) {
       console.error(`Could not send order alert to ${to}:`, err.message);
     }
+  }
+}
+
+// Lowers the item's "Саны" by 1 in the sheet. Returns the new quantity, or null if
+// it couldn't be changed (no number in "Саны", item not found, sheet error). Never throws.
+async function decreaseStock(item) {
+  try {
+    const rows = await fetchCatalog();
+    const row = rows.find((r) => r["Одежды"] === item);
+    const raw = String(row?.["Саны"] ?? "").trim();
+    if (!row || raw === "" || !Number.isFinite(Number(raw))) return null;
+    const left = Math.max(0, Number(raw) - 1);
+    const result = await updateCatalog("qty", item, left);
+    if (!result.ok) {
+      console.error(`Could not lower stock for ${JSON.stringify(item)}: ${result.error}`);
+      return null;
+    }
+    catalogCache = { rows: null, at: 0 }; // the next message reads the new quantity
+    console.log(`Stock for ${JSON.stringify(item)}: ${raw} -> ${left}`);
+    return left;
+  } catch (err) {
+    console.error("Could not lower stock:", err.message);
+    return null;
   }
 }
 
