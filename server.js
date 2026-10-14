@@ -70,7 +70,7 @@ Set "needs_owner" to true whenever your reply says you'll check with the owner, 
 
 CRITICAL, CHECK THIS LAST BEFORE YOU ANSWER: read back your own "reply" text. Does it contain anything like "уточню у владельца", "скоро вернусь с ответом", "спрошу у владельца", "tактап", "I'll check with the owner", "I'll get back to you", "I'll ask the owner", or any other promise that a human will follow up? If yes, "needs_owner" MUST be true — no exceptions, even if you answered a similar question this way earlier in the conversation. Only set "needs_owner" to false when your reply fully answers the question itself, with no promise of a follow-up from anyone.
 
-ORDERS: Set "order" to true only when the customer clearly confirms they want to BUY a specific item right now — phrases like "беру", "заказываю", "хочу купить это", "алам", "беру этот", "I'll take it", "I want to order this". A question about price, size or availability is NOT an order, even if they seem interested — only a clear purchase confirmation counts. When "order" is true, you must be able to tell exactly which single item they mean from the conversation (the item they were just discussing); if it's unclear which item, set "order" to false and ask them to confirm which item instead. When "order" is true, also fill "order_item" (the exact item name, copied character-for-character from the product data's item name field) and "order_price" (the numeric price for that item, as a plain number with no currency symbol). Your "reply" should warmly confirm the order back to the customer. When "order" is false, leave "order_item" and "order_price" as empty strings.
+ORDERS: Set "order" to true only when the customer clearly confirms they want to BUY a specific item right now — phrases like "беру", "заказываю", "хочу купить это", "алам", "беру этот", "I'll take it", "I want to order this". More phrases that count as a purchase confirmation: "хочу купить", "хочу заказать", "хочу его", "оформляйте", "давайте оформим", "сатып алам", "алгым келет", "алам", "I want to buy it", "I'll buy it", "I want it", "let's do it". If the customer says one of these about the item you were just discussing, it IS an order. CONSISTENCY CHECK: if your "reply" confirms or thanks the customer for an order (for example "вы заказали...", "ваш заказ принят", "you've ordered..."), then "order" MUST be true and "order_item" and "order_price" MUST be filled in. Never write an order confirmation while leaving "order" false. A question about price, size or availability is NOT an order, even if they seem interested — only a clear purchase confirmation counts. When "order" is true, you must be able to tell exactly which single item they mean from the conversation (the item they were just discussing); if it's unclear which item, set "order" to false and ask them to confirm which item instead. When "order" is true, also fill "order_item" (the exact item name, copied character-for-character from the product data's item name field) and "order_price" (the numeric price for that item, as a plain number with no currency symbol). Your "reply" should warmly confirm the order back to the customer. When "order" is false, leave "order_item" and "order_price" as empty strings.
 
 Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>, "order": <true or false>, "order_item": "<exact item name or empty string>", "order_price": <number or empty string>}
 
@@ -297,6 +297,18 @@ const OWNER_WORD = /влад[её]л|хозя|ээси|ээден|ээге|\bown
 const CHECKING_WORD = /уточн|узна|спрош|поинтерес|свяж|тактап|сообщ|дам знать|вернусь|напишу|напиш|отвеч|check|ask|find out|get back|let you know|confirm/i;
 const DEFERS_TO_OWNER = (text) => OWNER_WORD.test(text) && CHECKING_WORD.test(text);
 
+// Wording a reply uses when it confirms an order to the customer (Russian, Kyrgyz, English).
+const ORDER_CONFIRMED =
+  /заказали|заказ\s+(принят|оформлен|подтвержд)|оформил[аи]?\s+заказ|you['’]?ve ordered|you ordered|order (has been |is )?(placed|confirmed|received)|буйрутма(ңыз)?\s+(кабыл|тапшыр|бер)|заказ\s+бердиңиз/i;
+
+// Compare item names ignoring case, extra spaces and which kind of dash is used.
+const normName = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/[—–−-]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
 // ---------- OpenAI ----------
 async function askAI(from, userText) {
   const rows = await fetchCatalog();
@@ -373,7 +385,10 @@ async function askAI(from, userText) {
   let orderItem = "";
   let orderPrice = "";
   if (parsed.order === true && parsed.order_item) {
-    const matchedRow = rows.find((r) => r["Одежды"] === parsed.order_item);
+    // exact name first, then ignoring case, spacing and the kind of dash used
+    const matchedRow =
+      rows.find((r) => r["Одежды"] === parsed.order_item) ||
+      rows.find((r) => normName(r["Одежды"]) === normName(parsed.order_item));
     if (matchedRow) {
       order = true;
       orderItem = matchedRow["Одежды"];
@@ -382,6 +397,11 @@ async function askAI(from, userText) {
       console.log(`AI tried to order an item not in the catalog, ignoring: ${JSON.stringify(parsed.order_item)}`);
     }
   }
+
+  // Safety net: the AI's own "order" flag isn't fully reliable. If its reply
+  // confirms an order but no valid catalog item was recorded, flag a POSSIBLE
+  // order so the owner still gets an alert (the owner then checks it by hand).
+  const orderUncertain = !order && !reply.includes("?") && ORDER_CONFIRMED.test(reply);
 
   past.push(
     { role: "user", content: userText, at: now },
@@ -396,7 +416,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply), order, orderItem, orderPrice };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply), order, orderItem, orderPrice, orderUncertain };
 }
 
 // ---------- WhatsApp sending ----------
@@ -599,6 +619,29 @@ async function recordOrder(customer, item, price) {
   }
 }
 
+// The bot told a customer their order is confirmed but couldn't tell exactly which
+// catalog item it was, so nothing was written to the Orders sheet. Alert the owner
+// anyway so a real purchase is never missed. Never throws.
+async function notifyPossibleOrder(customer, message, botReply) {
+  const body = [
+    "🛒 Похоже, клиент хочет заказать",
+    "(бот не смог точно определить товар, поэтому в таблицу заказ не записан. Проверьте переписку.)",
+    `Клиент: +${customer}`,
+    `Сообщение: «${message}»`,
+    `Бот ответил: «${botReply}»`,
+    `Написать клиенту: https://wa.me/${customer}`,
+    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
+  ].join("\n");
+  for (const to of ORDER_ALERT_TO) {
+    try {
+      const wamid = await sendText(to, body);
+      await rememberAlert(wamid, customer, message);
+    } catch (err) {
+      console.error(`Could not send possible-order alert to ${to}:`, err.message);
+    }
+  }
+}
+
 function catalogReplyText(result, action) {
   if (result.ok) {
     const actionText = { sold: "ПРОДАН, количество 0", instock: "в наличии, количество обновлено", price: "цена обновлена", qty: "количество обновлено" }[action];
@@ -719,7 +762,7 @@ async function handleMessage(msg) {
 
   let counted = false; // so one customer message is never counted twice in the stats
   try {
-    const { reply, image, video, needsOwner, order, orderItem, orderPrice } = await askAI(from, msg.text.body);
+    const { reply, image, video, needsOwner, order, orderItem, orderPrice, orderUncertain } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
@@ -736,6 +779,7 @@ async function handleMessage(msg) {
     console.log(`order=${order} item=${JSON.stringify(orderItem)} price=${JSON.stringify(orderPrice)} for message from ${from}: "${msg.text.body}"`);
     if (needsOwner) await notifyOwner(from, msg.text.body, reply);
     if (order) await recordOrder(from, orderItem, orderPrice);
+    else if (orderUncertain) await notifyPossibleOrder(from, msg.text.body, reply);
   } catch (err) {
     console.error("Failed to answer:", err.message);
     if (!counted) await bump("messages");
