@@ -151,6 +151,91 @@ async function saveHistory(from, past) {
 const bishkekTime = (ms) =>
   new Date(ms).toLocaleString("ru-RU", { timeZone: "Asia/Bishkek", dateStyle: "long", timeStyle: "short" });
 
+// ---------- Analytics ----------
+// Simple daily counters kept in Upstash Redis (one hash per day: stats:YYYY-MM-DD).
+// The owner texts "статистика" to get today + the last 7 days. Without Upstash the
+// counters live in server memory only (lost on restart). Recording a stat never
+// throws, so analytics can never break a customer's reply.
+const MINUTES_PER_REPLY = Number(process.env.MINUTES_PER_REPLY) || 2; // rough time a human spends on one reply
+const STATS_DAYS = 60; // daily counters are deleted after this many days
+const STAT_FIELDS = ["messages", "answered", "escalated", "orders", "errors"];
+const localStats = new Map(); // day -> { field: count }, fallback when Redis is off or unreachable
+
+const bishkekDay = (ms = Date.now()) =>
+  new Date(ms).toLocaleDateString("en-CA", { timeZone: "Asia/Bishkek" }); // "2026-10-14"
+
+async function bump(field) {
+  try {
+    const day = bishkekDay();
+    const local = localStats.get(day) || {};
+    local[field] = (local[field] || 0) + 1;
+    localStats.set(day, local);
+    if (useRedis) {
+      const key = `stats:${day}`;
+      await redis(["HINCRBY", key, field, "1"]);
+      await redis(["EXPIRE", key, String(STATS_DAYS * 86400)]);
+    }
+  } catch (err) {
+    console.error("Could not record stat:", err.message);
+  }
+}
+
+async function loadDay(day) {
+  if (useRedis) {
+    try {
+      const raw = await redis(["HGETALL", `stats:${day}`]);
+      const out = {};
+      if (Array.isArray(raw)) {
+        for (let i = 0; i + 1 < raw.length; i += 2) out[raw[i]] = Number(raw[i + 1]) || 0;
+      } else if (raw && typeof raw === "object") {
+        for (const k of Object.keys(raw)) out[k] = Number(raw[k]) || 0;
+      }
+      return out;
+    } catch (err) {
+      console.error("Could not load stats, using local copy:", err.message);
+    }
+  }
+  return localStats.get(day) || {};
+}
+
+const sumStats = (list) =>
+  list.reduce((total, d) => {
+    for (const k of STAT_FIELDS) total[k] = (total[k] || 0) + (d[k] || 0);
+    return total;
+  }, {});
+
+function fmtMinutes(min) {
+  if (min < 60) return `${min} мин`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `${h} ч ${m} мин` : `${h} ч`;
+}
+
+function statsBlock(s) {
+  const messages = s.messages || 0;
+  const answered = s.answered || 0;
+  const pct = messages ? Math.round((answered / messages) * 100) : 0;
+  return [
+    `💬 Сообщений от клиентов: ${messages}`,
+    `✅ Бот ответил сам: ${answered} (${pct}%)`,
+    `🙋 Передано вам: ${s.escalated || 0}`,
+    `🛒 Заказов: ${s.orders || 0}`,
+    `⚠️ Ошибок: ${s.errors || 0}`,
+    `⏱ Сэкономлено времени: ~${fmtMinutes(answered * MINUTES_PER_REPLY)}`,
+  ].join("\n");
+}
+
+async function buildStatsReport() {
+  const days = Array.from({ length: 7 }, (_, i) => bishkekDay(Date.now() - i * 86400000));
+  const data = await Promise.all(days.map(loadDay));
+  return (
+    `📊 Статистика\n\n` +
+    `Сегодня\n${statsBlock(data[0])}\n\n` +
+    `За 7 дней\n${statsBlock(sumStats(data))}\n\n` +
+    `Время — примерная оценка: ${MINUTES_PER_REPLY} мин на один ответ.`
+  );
+}
+
 // Handle one customer's messages one at a time, so quick back-to-back messages
 // don't overwrite each other's memory and replies stay in order.
 const queues = new Map();
@@ -342,6 +427,7 @@ const isOwner = (from) => Boolean(OWNER_ID) && String(from).replace(/\D/g, "") =
 const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s*бот)$/i;
 const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
 const STATUS_CMD = /^(bot\s*status|статус\s*бота)$/i;
+const STATS_CMD = /^(stats|bot\s*stats|статистика|статистика\s*бота)$/i;
 
 // Catalog-update commands, texted by the owner. Examples:
 //   "бежевый пиджак продан"        -> marks that item out of stock
@@ -478,6 +564,14 @@ async function handleMessage(msg) {
       await sendText(from, botEnabled ? "🟢 Бот включён." : "🔴 Бот выключен.");
       return;
     }
+    if (STATS_CMD.test(t)) {
+      const report = await buildStatsReport().catch((err) => {
+        console.error("Stats report failed:", err.message);
+        return "⚠️ Не удалось собрать статистику, попробуйте ещё раз.";
+      });
+      await sendText(from, report);
+      return;
+    }
     const catalogReply = await tryHandleCatalogCommand(t).catch((err) => {
       console.error("Catalog update failed:", err.message);
       return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
@@ -498,11 +592,16 @@ async function handleMessage(msg) {
     return;
   }
 
+  let counted = false; // so one customer message is never counted twice in the stats
   try {
     const { reply, image, video, needsOwner, order, orderItem, orderPrice } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
+    counted = true;
+    await bump("messages");
+    await bump(needsOwner ? "escalated" : "answered");
+    if (order) await bump("orders");
     // TEMP DEBUG: log the AI's needs_owner decision for every message.
     // Remove this line once we've confirmed alerts are firing as expected.
     console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
@@ -514,6 +613,8 @@ async function handleMessage(msg) {
     if (order) await recordOrder(from, orderItem, orderPrice);
   } catch (err) {
     console.error("Failed to answer:", err.message);
+    if (!counted) await bump("messages");
+    await bump("errors");
     const lang = await customerLanguage(from, msg.text.body).catch(() => "ru");
     await sendText(from, FIXED.checking[lang]).catch(() => {});
     await notifyOwner(from, msg.text.body, FIXED.checking[lang], "⚠️ Бот не смог ответить (ошибка).");
