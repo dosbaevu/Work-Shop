@@ -412,11 +412,101 @@ async function sendWhatsApp(payload) {
   if (!res.ok) {
     throw new Error(`WhatsApp send error ${res.status}: ${await res.text()}`);
   }
+  const data = await res.json().catch(() => ({}));
+  return data.messages?.[0]?.id; // WhatsApp's id for the message we just sent
 }
 
 const sendText = (to, body) => sendWhatsApp({ to, type: "text", text: { body } });
 const sendImage = (to, link) => sendWhatsApp({ to, type: "image", image: { link } });
 const sendVideo = (to, link) => sendWhatsApp({ to, type: "video", video: { link } });
+
+// ---------- Owner answers a customer through the bot ----------
+// Every "🔔 customer needs you" alert is remembered (by its WhatsApp message id).
+// When the owner REPLIES to that alert (swipe-reply), the owner's words are turned
+// into a natural message in the customer's language and sent to the customer from
+// the shop number. Starting the reply with "!" sends it word for word instead.
+const ALERT_DAYS = 7; // an alert can be answered this long after it was sent
+const localAlerts = new Map(); // fallback when Redis is off or unreachable
+
+async function rememberAlert(wamid, customer, question) {
+  if (!wamid) return;
+  const value = { customer, question };
+  localAlerts.set(wamid, value);
+  if (localAlerts.size > 500) localAlerts.delete(localAlerts.keys().next().value);
+  if (useRedis) {
+    try {
+      await redis(["SET", `alert:${wamid}`, JSON.stringify(value), "EX", String(ALERT_DAYS * 86400)]);
+    } catch (err) {
+      console.error("Could not save alert link:", err.message);
+    }
+  }
+}
+
+async function lookupAlert(wamid) {
+  if (useRedis) {
+    try {
+      const raw = await redis(["GET", `alert:${wamid}`]);
+      if (raw) return JSON.parse(raw);
+    } catch (err) {
+      console.error("Could not load alert link, using local copy:", err.message);
+    }
+  }
+  return localAlerts.get(wamid) || null;
+}
+
+// Turns the owner's short answer into a natural message for the customer.
+async function composeOwnerReply(customer, question, ownerText) {
+  const past = (await loadHistory(customer)).slice(-6);
+  const transcript = past.map((m) => `${m.role === "user" ? "Customer" : "Shop"}: ${m.content}`).join("\n");
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0.3,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `You write one WhatsApp message to a customer of a small clothing shop, speaking as the shop, on behalf of the shop owner.
+The owner gave you their answer in their own words. Turn it into a short, warm, natural chat message that says exactly what the owner said. Do not add facts, prices, times or promises the owner did not state, and do not leave out anything they said.
+Reply in the same language as the customer's question (Russian, Kyrgyz or English). In Russian and Kyrgyz use no Latin-alphabet words, except clothing size labels such as S, M, L, XL.
+Never mention AI, a bot, or that the owner passed on a note: just speak as the shop.
+Answer ONLY with a JSON object: {"reply": "<message for the customer>", "language": "<ky, ru or en>"}`,
+        },
+        {
+          role: "user",
+          content: `Recent chat:\n${transcript || "(none)"}\n\nThe customer's question that needed the owner: ${question}\n\nOwner's answer: ${ownerText}`,
+        },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const parsed = JSON.parse(data.choices[0].message.content);
+  return { reply: String(parsed.reply || "").trim(), lang: LANGS.includes(parsed.language) ? parsed.language : undefined };
+}
+
+// Sends the owner's answer to the customer and adds it to the customer's chat
+// memory, so the bot knows what was said when the customer writes again.
+function relayOwnerReply(alert, ownerText) {
+  const customer = alert.customer;
+  return runInOrder(customer, async () => {
+    let reply;
+    let lang;
+    if (ownerText.startsWith("!")) {
+      reply = ownerText.slice(1).trim(); // "!" = send exactly as typed
+    } else {
+      ({ reply, lang } = await composeOwnerReply(customer, alert.question, ownerText));
+    }
+    if (!reply) throw new Error("empty reply");
+    await sendText(customer, reply);
+    const past = await loadHistory(customer);
+    past.push({ role: "assistant", content: reply, at: Date.now(), ...(lang && { lang }) });
+    await saveHistory(customer, past);
+    return reply;
+  });
+}
 
 // ---------- Bot Status toggle ----------
 // The owner can pause/resume the AI by texting the shop number from their own phone
@@ -557,6 +647,26 @@ async function handleMessage(msg) {
   // Owner-only commands to pause/resume the bot, checked before anything else
   if (msg.type === "text" && isOwner(from)) {
     const t = msg.text.body.trim();
+
+    // The owner swipe-replied to a "🔔 customer needs you" alert: pass the answer on.
+    const quotedId = msg.context?.id;
+    if (quotedId) {
+      const alert = await lookupAlert(quotedId);
+      if (alert) {
+        try {
+          const sent = await relayOwnerReply(alert, t);
+          await sendText(from, `✅ Отправил клиенту +${alert.customer}:\n«${sent}»`);
+        } catch (err) {
+          console.error("Could not pass the owner's answer to the customer:", err.message);
+          await sendText(
+            from,
+            `⚠️ Не удалось отправить клиенту. Возможно, прошло больше 24 часов с его последнего сообщения. Напишите ему напрямую: https://wa.me/${alert.customer}`
+          ).catch(() => {});
+        }
+        return;
+      }
+    }
+
     if (OFF_CMD.test(t)) {
       botEnabled = false;
       await sendText(from, "🔴 Бот приостановлен. Напишите «бот вкл», чтобы снова включить.");
@@ -663,12 +773,14 @@ async function notifyOwner(customer, question, botReply, note = "") {
     `Вопрос: «${question}»`,
     `Бот ответил: «${botReply}»`,
     `Написать клиенту: https://wa.me/${customer}`,
+    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
   ]
     .filter(Boolean)
     .join("\n");
   for (const to of ALERT_TO) {
     try {
-      await sendText(to, body);
+      const wamid = await sendText(to, body);
+      await rememberAlert(wamid, customer, question);
       // TEMP DEBUG: confirm the alert actually made it out successfully.
       console.log(`Alert sent to ${to} about customer ${customer}`);
     } catch (err) {
