@@ -45,7 +45,8 @@ Exchange only within 3 days if tags are still attached. No refunds.`;
 function buildSystemPrompt(rows) {
   return `You are the WhatsApp assistant for a small clothing shop. Answer customer questions warmly and briefly, like a real quick chat reply, not a formal essay. Only use the shop information and product data below; if something isn't covered by them, say you'll check with the owner and get back to them rather than guessing. Never infer availability, price, or color from similar products. Never mention that you are an AI.
 
-LANGUAGE: Customers write in Russian or Kyrgyz (occasionally English). Always reply in the language of the customer's LATEST message, and switch if they switch.
+LANGUAGE: Customers write in Russian, Kyrgyz or English. Always reply in the language of the customer's LATEST message, and switch if they switch. A system line near the end of the conversation, "LANGUAGE FOR THIS REPLY", names that language: follow it exactly.
+- If the customer writes in English, reply entirely in English, with no Russian or Kyrgyz words. Greet with "Hello" or "Hi". Translate the catalog's item names, colors and descriptions into natural English (for example "Льняная рубашка — белая" becomes "white linen shirt"). The only exception is "order_item", which must still be copied exactly from the catalog.
 - Kyrgyz is a different language from Russian, even though both use Cyrillic. Kyrgyz messages often contain the letters ң, ө, ү or words like салам, саламатсызбы, канча, барбы, бар, жок, рахмат, кандай, эмне, керек, көрсөтүңүз. If the customer writes in Kyrgyz, reply entirely in Kyrgyz and never answer a Kyrgyz message in Russian. Greet with "Саламатсызбы" (or "Салам" if they were casual). In Kyrgyz replies, product names may stay exactly as written in the catalog.
 - If the customer writes in Russian, reply in Russian. Greet with "Здравствуйте" (or "Привет" if they were casual), never "Hi". Translate colors, materials and descriptive words into Russian (e.g. "oversized" becomes "оверсайз").
 - In Russian and Kyrgyz replies use no Latin-alphabet words, except clothing size labels such as S, M, L, XL, which stay as they are.
@@ -421,6 +422,37 @@ const FIXED = {
   },
 };
 const KYRGYZ_LETTERS = /[ңөүҢӨҮ]/;
+// Common Kyrgyz words (for messages without ң, ө or ү). \b doesn't work with Cyrillic, so we use lookarounds.
+const KYRGYZ_WORDS =
+  /(?<![\p{L}])(салам|саламатсызбы|саламатсыздарбы|канча|барбы|жокпу|рахмат|кандай|эмне|керек|көрсөт\p{L}*|сүрөт\p{L}*|кечиресиз|болобу|баасы|өлчөм\p{L}*|алам|алгым|берсеңиз|жардам|бүгүн|кийим|буйрутма)(?![\p{L}])/iu;
+const SIZE_LABEL = /^(xs|s|m|l|xl|xxl|xxxl)$/;
+const LANG_NAME = { ru: "Russian", ky: "Kyrgyz", en: "English" };
+
+// "ru", "ky" or "en" for the language of a customer's message, or null when it's too
+// short or unclear to tell (a lone shop code, "ok", a number, just a size like "XL").
+function detectLanguage(text, shopCodes = []) {
+  const tokens = String(text || "")
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter((w) => w && !shopCodes.includes(w));
+  const t = tokens.join(" ");
+  const cyr = (t.match(/[Ѐ-ӿ]/g) || []).length;
+  const lat = (t.match(/[a-z]/g) || []).length;
+  if (cyr + lat < 2) return null;
+  if (lat > cyr) {
+    const englishWords = tokens.filter((w) => /^[a-z]{3,}$/.test(w) && !SIZE_LABEL.test(w));
+    return englishWords.length ? "en" : null;
+  }
+  return KYRGYZ_LETTERS.test(t) || KYRGYZ_WORDS.test(t) ? "ky" : "ru";
+}
+
+// Does a reply look like it is written in the wanted language? (by alphabet only)
+function replyMatchesLanguage(reply, target) {
+  const cyr = (reply.match(/[Ѐ-ӿ]/g) || []).length;
+  const lat = (reply.match(/[a-z]/gi) || []).length;
+  // Russian/Kyrgyz replies may contain a few Latin words (a shop name, a size like XL), so be tolerant
+  return target === "en" ? cyr <= lat : cyr * 2 >= lat;
+}
 
 // Kyrgyz if this message has Kyrgyz-only letters, otherwise the language the AI
 // last replied to this customer in, otherwise Russian.
@@ -505,34 +537,60 @@ async function askAI(from, userText) {
         ]
       : [];
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: buildSystemPrompt(rows) },
-        ...past.map(toOpenAIMessage),
-        ...visitNote,
-        { role: "user", content: userText },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
-  }
-  const data = await res.json();
+  // Which language to reply in, decided here (not left to the AI): the language of the
+  // customer's latest message; if that is unclear (e.g. just a shop code), the language
+  // we last used with them; for a brand-new chat, Russian.
+  const shopCodes = (await getShops()).map((s) => s.code);
+  const lastLang = [...past].reverse().find((m) => m.lang)?.lang;
+  const target = detectLanguage(userText, shopCodes) || lastLang || (past.length === 0 ? "ru" : null);
+  const langNote = target
+    ? [
+        {
+          role: "system",
+          content: `LANGUAGE FOR THIS REPLY: the customer's latest message is in ${LANG_NAME[target]}. Write the whole "reply" in ${LANG_NAME[target]} and set "language" to "${target}".`,
+        },
+      ]
+    : [];
 
-  let parsed;
-  try {
-    parsed = JSON.parse(data.choices[0].message.content);
-  } catch {
-    throw new Error("OpenAI returned something that is not valid JSON");
+  const callModel = async (extra = []) => {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: buildSystemPrompt(rows) },
+          ...past.map(toOpenAIMessage),
+          ...visitNote,
+          ...langNote,
+          ...extra,
+          { role: "user", content: userText },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
+    }
+    const data = await res.json();
+    try {
+      return JSON.parse(data.choices[0].message.content);
+    } catch {
+      throw new Error("OpenAI returned something that is not valid JSON");
+    }
+  };
+
+  let parsed = await callModel();
+  // If the reply came out in the wrong alphabet/language, ask once more, firmly.
+  if (target && !replyMatchesLanguage(String(parsed.reply || ""), target)) {
+    console.log(`Reply was not in ${target}, asking again`);
+    parsed = await callModel([
+      { role: "system", content: `Your previous answer was not in ${LANG_NAME[target]}. Answer again, entirely in ${LANG_NAME[target]}.` },
+    ]);
   }
   const reply = String(parsed.reply || "").trim();
 
@@ -554,7 +612,7 @@ async function askAI(from, userText) {
     if (video && past.some((m) => m.video === video)) video = "";
   }
 
-  const lang = LANGS.includes(parsed.language) ? parsed.language : undefined;
+  const lang = target || (LANGS.includes(parsed.language) ? parsed.language : undefined);
 
   // How the customer feels: the AI's judgement, backed up by the word list above.
   let mood = ["calm", "upset", "angry"].includes(parsed.mood) ? parsed.mood : "calm";
