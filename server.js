@@ -43,7 +43,21 @@ RETURNS
 Exchange only within 3 days if tags are still attached. No refunds.`;
 
 function buildSystemPrompt(rows) {
-  return `You are the WhatsApp assistant for a small clothing shop. Answer customer questions warmly and briefly, like a real quick chat reply, not a formal essay. Only use the shop information and product data below; if something isn't covered by them, say you'll check with the owner and get back to them rather than guessing. Never infer availability, price, or color from similar products. Never mention that you are an AI.
+  return `You work the WhatsApp chat of a small clothing shop, the way a friendly, quick-witted shop assistant would: you text, you do not write letters. Only use the shop information and product data below; if something isn't covered by them, say you'll check with the owner and get back to them rather than guessing. Never infer availability, price, or color from similar products.
+
+HUMAN STYLE (this matters as much as the facts; the reply must read like a real person typing on a phone):
+- Keep it short: usually 1 or 2 short sentences, 3 at the very most. Match the customer's length and energy: a one-word question gets a short answer.
+- Write the way people actually text: simple everyday words, a relaxed tone, contractions in English. No stiff or corporate phrases ("We are pleased to inform you", "Благодарим за обращение", "Рады сообщить", "Уважаемый клиент", "Обращайтесь, если возникнут вопросы"), and no customer-service filler such as "Конечно! Я с радостью вам помогу" or "Great question!".
+- Answer the actual question first, straight away. Add at most one useful extra detail (for example the other sizes, or that there is a photo). Never repeat the customer's question back to them.
+- Never use bullet points, numbered lists, bold text, headings or markdown in a reply. If several items fit, mention two or three in a sentence and ask which style they like instead of listing the whole catalog.
+- Greet only in the FIRST message of a chat, or when the customer says hello again after a long break. In later messages just answer, with no new greeting and no "Здравствуйте" at the start.
+- Don't end every message with a question or an offer of more help. Ask a follow-up only when it moves things forward (their size, which colour, whether they want to order), and ask only one thing at a time. Don't close with "Обращайтесь!" or "Let me know if you need anything else".
+- Vary how you start and finish replies; never use the same opening twice in a row. Small natural reactions are good when they fit ("о, отличный выбор", "ооо, этот сейчас очень берут", "ok, отлично", "аа, понятно"), but don't overdo it.
+- At most one emoji in a message, and many messages have none. Skip emojis completely when the customer is upset or the topic is serious.
+- Write prices as people say them ("5 500 сом"), and keep names of items short and natural, as a customer would say them, not as a spreadsheet row.
+- Speak as part of the shop team ("у нас", "мы", "we've got"). Do not invent a personal name, age, family, or life story for yourself. Never say things like "as an AI", "as a virtual assistant", "I am a bot", "my database", "according to the data", "the system" or "I'm programmed". If the customer asks something you can't see in the data, say it the way a shop assistant would: "сейчас уточню", never "у меня нет информации".
+- If a customer sincerely and directly asks whether they are talking to a real person or a bot, don't claim to be a human. Answer briefly and honestly that you are the shop's virtual assistant, and keep helping (the owner is always there for anything special). Never bring this up yourself.
+- Sound the same in every language: in Kyrgyz and Russian write the colloquial everyday way (not textbook or translated-sounding), in English plain casual shop English.
 
 LANGUAGE: Customers write in Russian, Kyrgyz or English. Always reply in the language of the customer's LATEST message, and switch if they switch. A system line near the end of the conversation, "LANGUAGE FOR THIS REPLY", names that language: follow it exactly.
 - If the customer writes in English, reply entirely in English, with no Russian or Kyrgyz words. Greet with "Hello" or "Hi". Translate the catalog's item names, colors and descriptions into natural English (for example "Зыгыр жейде — ак" becomes "white linen shirt"). The only exception is "order_item", which must still be copied exactly from the catalog.
@@ -438,12 +452,12 @@ function runInOrder(key, task) {
 const LANGS = ["ky", "ru", "en"];
 const FIXED = {
   notText: {
-    ru: "Пожалуйста, напишите вопрос текстом — я пока не понимаю голосовые сообщения и файлы.",
-    ky: "Сурооңузду текст менен жазып жибериңизчи — азырынча үн билдирүүлөрдү жана файлдарды түшүнө албайм.",
+    ru: "Ой, голосовое сейчас не получится послушать. Напишите текстом, пожалуйста 🙏",
+    ky: "Үн билдирүүнү азыр уга албайм. Тексттик билдирүү жазып жибересизби 🙏",
   },
   checking: {
-    ru: "Секунду, уточню у владельца и вернусь к вам.",
-    ky: "Бир мүнөт, дүкөндүн ээсинен тактап, сизге кайра жазам.",
+    ru: "Секунду, сейчас уточню и вернусь к вам.",
+    ky: "Бир мүнөт, азыр тактап, сизге кайра жазам.",
   },
 };
 const KYRGYZ_LETTERS = /[ңөүҢӨҮ]/;
@@ -586,7 +600,7 @@ async function askAI(from, userText) {
       },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        temperature: 0,
+        temperature: 0.6, // a little variety so replies don't sound canned
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt(rows) },
@@ -710,6 +724,27 @@ async function sendWhatsApp(payload) {
   }
   const data = await res.json().catch(() => ({}));
   return data.messages?.[0]?.id; // WhatsApp's id for the message we just sent
+}
+
+// Shows "typing…" to the customer (and marks their message as read) while we think.
+// Purely cosmetic: any failure is ignored.
+async function showTyping(messageId) {
+  if (!messageId || process.env.HUMAN_PAUSE === "off") return;
+  try {
+    await sendWhatsApp({ status: "read", message_id: messageId, typing_indicator: { type: "text" } });
+  } catch (err) {
+    console.log("Typing indicator not shown:", err.message.slice(0, 120));
+  }
+}
+
+// A real person needs a moment to type. Waits until `startedAt` + a pause that grows with
+// the length of the reply (about 1.5 s for a short one, 5 s at most), counting the time
+// the AI already took. Set HUMAN_PAUSE=off to disable (tests do this).
+async function humanPause(startedAt, text) {
+  if (process.env.HUMAN_PAUSE === "off") return;
+  const target = Math.min(5000, 1500 + String(text || "").length * 22);
+  const left = target - (Date.now() - startedAt);
+  if (left > 0) await new Promise((r) => setTimeout(r, left));
 }
 
 const sendText = (to, body) => sendWhatsApp({ to, type: "text", text: { body } });
@@ -1138,9 +1173,14 @@ async function handleCustomerMessage(msg, shop) {
   }
 
   let counted = false; // so one customer message is never counted twice in the stats
+  const startedAt = Date.now();
+  showTyping(msg.id); // not awaited: "typing…" appears while the AI works
   try {
     const { reply, image, video, needsOwner, mood, order, orderItem, orderPrice, orderUncertain } = await askAI(from, msg.text.body);
-    if (reply) await sendText(from, reply);
+    if (reply) {
+      await humanPause(startedAt, reply);
+      await sendText(from, reply);
+    }
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
     counted = true;
