@@ -403,10 +403,10 @@ const sumStats = (list) =>
   }, {});
 
 function fmtMinutes(min) {
-  if (min < 60) return `${min} мин`;
+  if (min < 60) return `${min} мүн`;
   const h = Math.floor(min / 60);
   const m = min % 60;
-  return m ? `${h} ч ${m} мин` : `${h} ч`;
+  return m ? `${h} саат ${m} мүн` : `${h} саат`;
 }
 
 function statsBlock(s) {
@@ -414,13 +414,13 @@ function statsBlock(s) {
   const answered = s.answered || 0;
   const pct = messages ? Math.round((answered / messages) * 100) : 0;
   return [
-    `💬 Сообщений от клиентов: ${messages}`,
-    `✅ Бот ответил сам: ${answered} (${pct}%)`,
-    `🙋 Передано вам: ${s.escalated || 0}`,
-    `🛒 Заказов: ${s.orders || 0}`,
-    `😟 Недовольных клиентов: ${s.complaints || 0}`,
-    `⚠️ Ошибок: ${s.errors || 0}`,
-    `⏱ Сэкономлено времени: ~${fmtMinutes(answered * MINUTES_PER_REPLY)}`,
+    `💬 Кардарлардан билдирүүлөр: ${messages}`,
+    `✅ Бот өзү жооп берди: ${answered} (${pct}%)`,
+    `🙋 Сизге өткөрүлдү: ${s.escalated || 0}`,
+    `🛒 Буйрутмалар: ${s.orders || 0}`,
+    `😟 Нааразы кардарлар: ${s.complaints || 0}`,
+    `⚠️ Каталар: ${s.errors || 0}`,
+    `⏱ Үнөмдөлгөн убакыт: ~${fmtMinutes(answered * MINUTES_PER_REPLY)}`,
   ].join("\n");
 }
 
@@ -429,9 +429,9 @@ async function buildStatsReport() {
   const data = await Promise.all(days.map(loadDay));
   return (
     `📊 Статистика\n\n` +
-    `Сегодня\n${statsBlock(data[0])}\n\n` +
-    `За 7 дней\n${statsBlock(sumStats(data))}\n\n` +
-    `Время — примерная оценка: ${MINUTES_PER_REPLY} мин на один ответ.`
+    `Бүгүн\n${statsBlock(data[0])}\n\n` +
+    `7 күн ичинде\n${statsBlock(sumStats(data))}\n\n` +
+    `Убакыт болжолдуу эсептелген: бир жооп үчүн ${MINUTES_PER_REPLY} мүн.`
   );
 }
 
@@ -454,10 +454,12 @@ const FIXED = {
   notText: {
     ru: "Ой, голосовое сейчас не получится послушать. Напишите текстом, пожалуйста 🙏",
     ky: "Үн билдирүүнү азыр уга албайм. Тексттик билдирүү жазып жибересизби 🙏",
+    en: "Sorry, I can't listen to voice messages right now. Could you type it out, please? 🙏",
   },
   checking: {
     ru: "Секунду, сейчас уточню и вернусь к вам.",
     ky: "Бир мүнөт, азыр тактап, сизге кайра жазам.",
+    en: "One sec, let me check and I'll get back to you.",
   },
 };
 const KYRGYZ_LETTERS = /[ңөүҢӨҮ]/;
@@ -496,10 +498,11 @@ function replyMatchesLanguage(reply, target) {
 // Kyrgyz if this message has Kyrgyz-only letters, otherwise the language the AI
 // last replied to this customer in, otherwise Russian.
 async function customerLanguage(from, text = "") {
-  if (KYRGYZ_LETTERS.test(text)) return "ky";
+  const now = detectLanguage(text);
+  if (now) return now;
   const past = await loadHistory(from);
   const lastLang = [...past].reverse().find((m) => m.lang)?.lang;
-  return lastLang === "ky" ? "ky" : "ru";
+  return ["ru", "ky", "en"].includes(lastLang) ? lastLang : "ky";
 }
 
 // Words customers use when they want to see a photo/video (Russian, Kyrgyz, English)
@@ -581,7 +584,7 @@ async function askAI(from, userText) {
   // we last used with them; for a brand-new chat, Russian.
   const shopCodes = (await getShops()).map((s) => s.code);
   const lastLang = [...past].reverse().find((m) => m.lang)?.lang;
-  const target = detectLanguage(userText, shopCodes) || lastLang || (past.length === 0 ? "ru" : null);
+  const target = detectLanguage(userText, shopCodes) || lastLang || (past.length === 0 ? "ky" : null);
   const langNote = target
     ? [
         {
@@ -860,11 +863,11 @@ async function ownerContext(from, text) {
   return { shop: owned[0], text, many: owned.length > 1 };
 }
 
-const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s*бот)$/i;
-const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
-const STATUS_CMD = /^(bot\s*status|статус\s*бота)$/i;
+const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп|өчүр|токтот)|стоп\s*бот)$/i;
+const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи|күйгүз|иштет))$/i;
+const STATUS_CMD = /^(bot\s*status|статус\s*бота|бот\s*абалы)$/i;
 const STATS_CMD = /^(stats|bot\s*stats|статистика|статистика\s*бота)$/i;
-const LOWSTOCK_CMD = /^(low\s*stock|остатки|что\s*заканчивается|заканчивается)$/i;
+const LOWSTOCK_CMD = /^(low\s*stock|остатки|что\s*заканчивается|заканчивается|калдык|калдыктар|эмне\s*бүтүп\s*баратат)$/i;
 
 // Catalog-update commands, texted by the owner. Examples:
 //   "бежевый пиджак продан"        -> sets its quantity ("Саны") to 0, i.e. sold out
@@ -872,10 +875,10 @@ const LOWSTOCK_CMD = /^(low\s*stock|остатки|что\s*заканчивае
 //   "цена на бежевый пиджак 2500"  -> sets its price
 //   "бежевый пиджак саны 3"        -> sets its quantity
 // Stock lives only in the "Саны" column (0 = sold out), there is no separate Бар/жок column.
-const SOLD_CMD = /^(.+?)\s+(продан[оа]?|жок)$/i;
+const SOLD_CMD = /^(.+?)\s+(продан[оа]?|жок|сатылды|бүттү)$/i;
 const INSTOCK_CMD = /^(.+?)\s+(?:в наличии|снова в наличии|бар)(?:\s+(\d+))?$/i;
-const PRICE_CMD_A = /^цена\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на X 2500"
-const PRICE_CMD_B = /^(.+?)\s+цена\s+(\d+)$/i; // "X цена 2500"
+const PRICE_CMD_A = /^(?:цена|баасы)\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на X 2500"
+const PRICE_CMD_B = /^(.+?)\s+(?:цена|баасы)\s+(\d+)$/i; // "X цена 2500"
 const QTY_CMD = /^(.+?)\s+(?:саны|количество)\s+(\d+)$/i; // "X саны 3"
 
 async function postToAppsScript(url, payload) {
@@ -936,14 +939,14 @@ async function recordOrder(customer, item, price) {
 
   const body = [
     shopLine(),
-    "🛒 Новый заказ!",
-    `Клиент: +${customer}`,
-    `Товар: «${item}»`,
-    `Цена: ${price} сом`,
+    "🛒 Жаңы буйрутма!",
+    `Кардар: +${customer}`,
+    `Кийим: «${item}»`,
+    `Баасы: ${price} сом`,
     ...(left === null
       ? []
-      : [left === 0 ? "📦 Осталось: 0 шт. — товар закончился!" : `📦 Осталось: ${left} шт.${left <= LOW_STOCK_THRESHOLD ? " ⚠️ заканчивается" : ""}`]),
-    `Написать клиенту: https://wa.me/${customer}`,
+      : [left === 0 ? "📦 Калды: 0 даана — бүттү!" : `📦 Калды: ${left} даана${left <= LOW_STOCK_THRESHOLD ? " ⚠️ аз калды" : ""}`]),
+    `Кардарга жазуу: https://wa.me/${customer}`,
   ].join("\n");
   for (const to of currentShop().orderAlertTo) {
     try {
@@ -962,12 +965,12 @@ const shopLine = () => `🏪 ${currentShop().name}`;
 async function notifyUpsetCustomer(customer, message, botReply, mood) {
   const body = [
     shopLine(),
-    mood === "angry" ? "🚨 Злой клиент, ответьте как можно скорее!" : "😟 Недовольный клиент, лучше ответить быстро",
-    `Клиент: +${customer}`,
-    `Сообщение: «${message}»`,
-    `Бот ответил: «${botReply}»`,
-    `Написать клиенту: https://wa.me/${customer}`,
-    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
+    mood === "angry" ? "🚨 Ачуулуу кардар, тез арада жооп бериңиз!" : "😟 Нааразы кардар, тезирээк жооп бергениңиз оң",
+    `Кардар: +${customer}`,
+    `Билдирүү: «${message}»`,
+    `Бот жооп берди: «${botReply}»`,
+    `Кардарга жазуу: https://wa.me/${customer}`,
+    "💬 Же ушул билдирүүгө жооп бериңиз (свайп), жообуңузду кардарга өзүм жеткирем.",
   ].join("\n");
   for (const to of currentShop().alertTo) {
     try {
@@ -1009,13 +1012,13 @@ async function decreaseStock(item) {
 async function notifyPossibleOrder(customer, message, botReply) {
   const body = [
     shopLine(),
-    "🛒 Похоже, клиент хочет заказать",
-    "(бот не смог точно определить товар, поэтому в таблицу заказ не записан. Проверьте переписку.)",
-    `Клиент: +${customer}`,
-    `Сообщение: «${message}»`,
-    `Бот ответил: «${botReply}»`,
-    `Написать клиенту: https://wa.me/${customer}`,
-    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
+    "🛒 Кардар буйрутма бергиси келет окшойт",
+    "(бот кайсы кийим экенин так аныктай алган жок, ошондуктан буйрутма таблицага жазылган жок. Чатты текшериңиз.)",
+    `Кардар: +${customer}`,
+    `Билдирүү: «${message}»`,
+    `Бот жооп берди: «${botReply}»`,
+    `Кардарга жазуу: https://wa.me/${customer}`,
+    "💬 Же ушул билдирүүгө жооп бериңиз (свайп), жообуңузду кардарга өзүм жеткирем.",
   ].join("\n");
   for (const to of currentShop().orderAlertTo) {
     try {
@@ -1029,13 +1032,13 @@ async function notifyPossibleOrder(customer, message, botReply) {
 
 function catalogReplyText(result, action) {
   if (result.ok) {
-    const actionText = { sold: "ПРОДАН, количество 0", instock: "в наличии, количество обновлено", price: "цена обновлена", qty: "количество обновлено" }[action];
+    const actionText = { sold: "САТЫЛДЫ, саны 0", instock: "бар, саны жаңыртылды", price: "баасы жаңыртылды", qty: "саны жаңыртылды" }[action];
     return `✅ «${result.item}» — ${actionText}.`;
   }
-  if (result.error === "not_found") return "❌ Не нашёл такой товар в каталоге. Проверьте название.";
-  if (result.error === "ambiguous") return `❓ Нашёл несколько похожих товаров, уточните название:\n${result.matches.join("\n")}`;
-  if (result.error === "not_configured") return "⚠️ Обновление каталога через WhatsApp ещё не настроено.";
-  return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
+  if (result.error === "not_found") return "❌ Каталогдон мындай кийим табылган жок. Атын текшериңиз.";
+  if (result.error === "ambiguous") return `❓ Окшош бир нече кийим табылды, атын так жазыңыз:\n${result.matches.join("\n")}`;
+  if (result.error === "not_configured") return "⚠️ WhatsApp аркылуу каталогду жаңыртуу али жөндөлө элек.";
+  return "⚠️ Каталогду жаңыртуу мүмкүн болгон жок, кайра аракет кылыңыз.";
 }
 
 async function tryHandleCatalogCommand(t) {
@@ -1046,7 +1049,7 @@ async function tryHandleCatalogCommand(t) {
   }
   if ((m = INSTOCK_CMD.exec(t))) {
     if (!m[2]) {
-      return `❓ Сколько штук «${m[1].trim()}» в наличии? Напишите, например: «${m[1].trim()} в наличии 5»`;
+      return `❓ «${m[1].trim()}» канча даана бар? Мисалы мындай жазыңыз: «${m[1].trim()} бар 5»`;
     }
     const result = await updateCatalog("qty", m[1].trim(), Number(m[2]));
     return catalogReplyText(result, "instock");
@@ -1080,12 +1083,12 @@ async function handleOwnerMessage(msg, owner) {
       await runAsShop(alertShop, async () => {
         try {
           const sent = await relayOwnerReply(alert, rawText);
-          await sendText(from, `✅ Отправил клиенту +${alert.customer}:\n«${sent}»`);
+          await sendText(from, `✅ +${alert.customer} кардарга жөнөтүлдү:\n«${sent}»`);
         } catch (err) {
           console.error("Could not pass the owner's answer to the customer:", err.message);
           await sendText(
             from,
-            `⚠️ Не удалось отправить клиенту. Возможно, прошло больше 24 часов с его последнего сообщения. Напишите ему напрямую: https://wa.me/${alert.customer}`
+            `⚠️ Кардарга жөнөтүү мүмкүн болгон жок. Кардардын акыркы билдирүүсүнөн 24 сааттан ашкан болушу мүмкүн. Ага түз жазыңыз: https://wa.me/${alert.customer}`
           ).catch(() => {});
         }
       });
@@ -1101,22 +1104,22 @@ async function handleOwnerMessage(msg, owner) {
 
     if (OFF_CMD.test(t)) {
       pausedShops.add(code);
-      await say("🔴 Бот приостановлен. Напишите «бот вкл», чтобы снова включить.");
+      await say("🔴 Бот убактылуу токтотулду. Кайра иштетүү үчүн «бот күйгүз» деп жазыңыз.");
       return true;
     }
     if (ON_CMD.test(t)) {
       pausedShops.delete(code);
-      await say("🟢 Бот снова отвечает клиентам.");
+      await say("🟢 Бот кардарларга кайра жооп берип жатат.");
       return true;
     }
     if (STATUS_CMD.test(t)) {
-      await say(pausedShops.has(code) ? "🔴 Бот выключен." : "🟢 Бот включён.");
+      await say(pausedShops.has(code) ? "🔴 Бот өчүк." : "🟢 Бот күйүк.");
       return true;
     }
     if (STATS_CMD.test(t)) {
       const report = await buildStatsReport().catch((err) => {
         console.error("Stats report failed:", err.message);
-        return "⚠️ Не удалось собрать статистику, попробуйте ещё раз.";
+        return "⚠️ Статистиканы чогултуу мүмкүн болгон жок, кайра аракет кылыңыз.";
       });
       await say(report);
       return true;
@@ -1124,14 +1127,14 @@ async function handleOwnerMessage(msg, owner) {
     if (LOWSTOCK_CMD.test(t)) {
       const { text } = await lowStockReport().catch((err) => {
         console.error("Low stock report failed:", err.message);
-        return { text: "⚠️ Не удалось проверить остатки, попробуйте ещё раз." };
+        return { text: "⚠️ Калдыктарды текшерүү мүмкүн болгон жок, кайра аракет кылыңыз." };
       });
       await say(text);
       return true;
     }
     const catalogReply = await tryHandleCatalogCommand(t).catch((err) => {
       console.error("Catalog update failed:", err.message);
-      return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
+      return "⚠️ Каталогду жаңыртуу мүмкүн болгон жок, кайра аракет кылыңыз.";
     });
     if (catalogReply) {
       await say(catalogReply);
@@ -1203,7 +1206,7 @@ async function handleCustomerMessage(msg, shop) {
     await bump("errors");
     const lang = await customerLanguage(from, msg.text.body).catch(() => "ru");
     await sendText(from, FIXED.checking[lang]).catch(() => {});
-    await notifyOwner(from, msg.text.body, FIXED.checking[lang], "⚠️ Бот не смог ответить (ошибка).");
+    await notifyOwner(from, msg.text.body, FIXED.checking[lang], "⚠️ Бот жооп бере алган жок (ката).");
   }
 }
 
@@ -1218,13 +1221,13 @@ async function notifyOwner(customer, question, botReply, note = "") {
   if (!shop.alertTo.length) return;
   const body = [
     shopLine(),
-    "🔔 Клиенту нужен ваш ответ",
+    "🔔 Кардарга сиздин жообуңуз керек",
     note,
-    `Клиент: +${customer}`,
-    `Вопрос: «${question}»`,
-    `Бот ответил: «${botReply}»`,
-    `Написать клиенту: https://wa.me/${customer}`,
-    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
+    `Кардар: +${customer}`,
+    `Суроо: «${question}»`,
+    `Бот жооп берди: «${botReply}»`,
+    `Кардарга жазуу: https://wa.me/${customer}`,
+    "💬 Же ушул билдирүүгө жооп бериңиз (свайп), жообуңузду кардарга өзүм жеткирем.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -1253,9 +1256,9 @@ async function lowStockReport() {
     .map((r) => ({ name: String(r["Одежды"] || "").trim(), qty: String(r["Саны"] ?? "").trim() }))
     .filter((r) => r.name && r.qty !== "" && Number.isFinite(Number(r.qty)) && Number(r.qty) <= LOW_STOCK_THRESHOLD)
     .sort((a, b) => Number(a.qty) - Number(b.qty));
-  if (!low.length) return { text: "✅ Всё в наличии, ничего не заканчивается.", count: 0 };
-  const lines = low.map((r) => (Number(r.qty) === 0 ? `• ${r.name} — закончилось` : `• ${r.name} — осталось ${r.qty} шт.`));
-  return { text: `📦 Заканчивается товар (${LOW_STOCK_THRESHOLD} шт. и меньше):\n\n${lines.join("\n")}`, count: low.length };
+  if (!low.length) return { text: "✅ Баары бар, эч нерсе бүтө элек.", count: 0 };
+  const lines = low.map((r) => (Number(r.qty) === 0 ? `• ${r.name} — бүттү` : `• ${r.name} — ${r.qty} даана калды`));
+  return { text: `📦 Кийим бүтүп баратат (${LOW_STOCK_THRESHOLD} даана жана аз):\n\n${lines.join("\n")}`, count: low.length };
 }
 
 // Text every alert number of the current shop. Never throws.
@@ -1285,7 +1288,7 @@ async function runScheduledTask(task) {
           console.log(`Scheduled lowstock for ${shop.code}: ${count} item(s) low`);
         } else {
           const today = await loadDay(bishkekDay());
-          await alertOwners(`${shopLine()}\n🌙 Итоги дня\n\n${statsBlock(today)}`);
+          await alertOwners(`${shopLine()}\n🌙 Күндүн жыйынтыгы\n\n${statsBlock(today)}`);
           console.log(`Scheduled summary sent for ${shop.code}`);
         }
       } catch (err) {
@@ -1305,7 +1308,7 @@ app.use(
   })
 );
 
-app.get("/", (_req, res) => res.send("Aiperi Wear assistant is running"));
+app.get("/", (_req, res) => res.send("Beta AI is running"));
 
 // An outside timer (cron-job.org) calls this at set times, e.g.
 //   https://YOUR-APP.onrender.com/cron/lowstock?key=UPDATE_SECRET   (morning)
