@@ -52,6 +52,8 @@ LANGUAGE: Customers write in Russian or Kyrgyz (occasionally English). Always re
 
 Product data is fresh from the shop's spreadsheet with every message. Always use it, never rely on earlier messages for prices or stock.
 
+STOCK: whether an item is available comes ONLY from its "Саны" field, the number of pieces in stock. If "Саны" is 0, the item is sold out right now, so say it's not available at the moment. If it is 1 or more, the item is in stock. If "Саны" is empty, you don't know the stock, so say you'll check with the owner. Don't volunteer exact numbers, just say it's available; if the customer asks how many are left, tell them the number from "Саны".
+
 You may see earlier messages with this customer, sometimes from previous days. Use them to remember what the customer asked about, liked, or ordered, and their size, so they don't have to repeat themselves.
 
 Each product object may have a "Photo" field and a "Video" field. These are independent of each other — an item can have a photo, a video, both, or neither, regardless of what the other field contains. Check each one separately; never assume one is empty just because the other is.
@@ -431,12 +433,13 @@ const STATS_CMD = /^(stats|bot\s*stats|статистика|статистика
 const LOWSTOCK_CMD = /^(low\s*stock|остатки|что\s*заканчивается|заканчивается)$/i;
 
 // Catalog-update commands, texted by the owner. Examples:
-//   "бежевый пиджак продан"        -> marks that item out of stock
-//   "бежевый пиджак в наличии"     -> marks it back in stock
+//   "бежевый пиджак продан"        -> sets its quantity ("Саны") to 0, i.e. sold out
+//   "бежевый пиджак в наличии 5"   -> sets its quantity to 5, i.e. back in stock
 //   "цена на бежевый пиджак 2500"  -> sets its price
 //   "бежевый пиджак саны 3"        -> sets its quantity
+// Stock lives only in the "Саны" column (0 = sold out), there is no separate Бар/жок column.
 const SOLD_CMD = /^(.+?)\s+(продан[оа]?|жок)$/i;
-const INSTOCK_CMD = /^(.+?)\s+(в наличии|снова в наличии|бар)$/i;
+const INSTOCK_CMD = /^(.+?)\s+(?:в наличии|снова в наличии|бар)(?:\s+(\d+))?$/i;
 const PRICE_CMD_A = /^цена\s+(?:на\s+)?(.+?)\s+(\d+)$/i; // "цена на X 2500"
 const PRICE_CMD_B = /^(.+?)\s+цена\s+(\d+)$/i; // "X цена 2500"
 const QTY_CMD = /^(.+?)\s+(?:саны|количество)\s+(\d+)$/i; // "X саны 3"
@@ -508,7 +511,7 @@ async function recordOrder(customer, item, price) {
 
 function catalogReplyText(result, action) {
   if (result.ok) {
-    const actionText = { sold: "отмечен как ПРОДАН", instock: "отмечен как В НАЛИЧИИ", price: "цена обновлена", qty: "количество обновлено" }[action];
+    const actionText = { sold: "ПРОДАН, количество 0", instock: "в наличии, количество обновлено", price: "цена обновлена", qty: "количество обновлено" }[action];
     return `✅ «${result.item}» — ${actionText}.`;
   }
   if (result.error === "not_found") return "❌ Не нашёл такой товар в каталоге. Проверьте название.";
@@ -520,11 +523,14 @@ function catalogReplyText(result, action) {
 async function tryHandleCatalogCommand(t) {
   let m;
   if ((m = SOLD_CMD.exec(t))) {
-    const result = await updateCatalog("sold", m[1].trim());
+    const result = await updateCatalog("qty", m[1].trim(), 0); // sold out = quantity 0
     return catalogReplyText(result, "sold");
   }
   if ((m = INSTOCK_CMD.exec(t))) {
-    const result = await updateCatalog("instock", m[1].trim());
+    if (!m[2]) {
+      return `❓ Сколько штук «${m[1].trim()}» в наличии? Напишите, например: «${m[1].trim()} в наличии 5»`;
+    }
+    const result = await updateCatalog("qty", m[1].trim(), Number(m[2]));
     return catalogReplyText(result, "instock");
   }
   if ((m = PRICE_CMD_A.exec(t)) || (m = PRICE_CMD_B.exec(t))) {
