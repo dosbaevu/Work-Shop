@@ -72,7 +72,9 @@ CRITICAL, CHECK THIS LAST BEFORE YOU ANSWER: read back your own "reply" text. Do
 
 ORDERS: Set "order" to true only when the customer clearly confirms they want to BUY a specific item right now — phrases like "беру", "заказываю", "хочу купить это", "алам", "беру этот", "I'll take it", "I want to order this". More phrases that count as a purchase confirmation: "хочу купить", "хочу заказать", "хочу его", "оформляйте", "давайте оформим", "сатып алам", "алгым келет", "алам", "I want to buy it", "I'll buy it", "I want it", "let's do it". If the customer says one of these about the item you were just discussing, it IS an order. CONSISTENCY CHECK: if your "reply" confirms or thanks the customer for an order (for example "вы заказали...", "ваш заказ принят", "you've ordered..."), then "order" MUST be true and "order_item" and "order_price" MUST be filled in. Never write an order confirmation while leaving "order" false. A question about price, size or availability is NOT an order, even if they seem interested — only a clear purchase confirmation counts. When "order" is true, you must be able to tell exactly which single item they mean from the conversation (the item they were just discussing); if it's unclear which item, set "order" to false and ask them to confirm which item instead. When "order" is true, also fill "order_item" (the exact item name, copied character-for-character from the product data's item name field) and "order_price" (the numeric price for that item, as a plain number with no currency symbol). Your "reply" should warmly confirm the order back to the customer. When "order" is false, leave "order_item" and "order_price" as empty strings.
 
-Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>, "order": <true or false>, "order_item": "<exact item name or empty string>", "order_price": <number or empty string>}
+MOOD: judge the customer's LATEST message and put "calm", "upset" or "angry" in "mood". "angry" means clearly angry, rude, insulting, threatening, or demanding a refund or the manager in a harsh way. "upset" means disappointed or complaining about something that went wrong (late or wrong order, bad quality, poor service). Everything else, including normal questions about returns or delivery, is "calm". When "mood" is "upset" or "angry": apologize sincerely in one short sentence, do not argue or make excuses, do not promise a refund, discount or any compensation, and say the owner will personally get in touch very soon. Set "needs_owner" to true.
+
+Answer ONLY with a JSON object: {"reply": "<text for the customer>", "image_url": "<photo URL or empty string>", "video_url": "<video URL or empty string>", "language": "<ky, ru or en>", "needs_owner": <true or false>, "order": <true or false>, "order_item": "<exact item name or empty string>", "order_price": <number or empty string>, "mood": "<calm, upset or angry>"}
 
 PRODUCT DATA (JSON, one object per product):
 ${JSON.stringify(rows)}
@@ -160,7 +162,7 @@ const bishkekTime = (ms) =>
 // throws, so analytics can never break a customer's reply.
 const MINUTES_PER_REPLY = Number(process.env.MINUTES_PER_REPLY) || 2; // rough time a human spends on one reply
 const STATS_DAYS = 60; // daily counters are deleted after this many days
-const STAT_FIELDS = ["messages", "answered", "escalated", "orders", "errors"];
+const STAT_FIELDS = ["messages", "answered", "escalated", "orders", "complaints", "errors"];
 const localStats = new Map(); // day -> { field: count }, fallback when Redis is off or unreachable
 
 const bishkekDay = (ms = Date.now()) =>
@@ -222,6 +224,7 @@ function statsBlock(s) {
     `✅ Бот ответил сам: ${answered} (${pct}%)`,
     `🙋 Передано вам: ${s.escalated || 0}`,
     `🛒 Заказов: ${s.orders || 0}`,
+    `😟 Недовольных клиентов: ${s.complaints || 0}`,
     `⚠️ Ошибок: ${s.errors || 0}`,
     `⏱ Сэкономлено времени: ~${fmtMinutes(answered * MINUTES_PER_REPLY)}`,
   ].join("\n");
@@ -296,6 +299,12 @@ function toOpenAIMessage(m) {
 const OWNER_WORD = /влад[её]л|хозя|ээси|ээден|ээге|\bowner\b/i;
 const CHECKING_WORD = /уточн|узна|спрош|поинтерес|свяж|тактап|сообщ|дам знать|вернусь|напишу|напиш|отвеч|check|ask|find out|get back|let you know|confirm/i;
 const DEFERS_TO_OWNER = (text) => OWNER_WORD.test(text) && CHECKING_WORD.test(text);
+
+// Strongly negative words in a CUSTOMER message (Russian, Kyrgyz, English). A backstop
+// for the AI's "mood" judgement, which isn't fully reliable on its own. Deliberately
+// leaves out neutral words like "возврат", so asking about returns is not a complaint.
+const COMPLAINT_WORD =
+  /ужас|кошмар|безобраз|обман|мошенни|развод|хамств|хамит|наглост|отвратительн|отстой|недовол|возмутительн|жалоб|надоел|сколько можно|scam|terrible|awful|worst|rude|disgust|unacceptable|complain|ridiculous|алдап|алдад|нааразы|шармандалык|уят эмеспи/i;
 
 // Wording a reply uses when it confirms an order to the customer (Russian, Kyrgyz, English).
 const ORDER_CONFIRMED =
@@ -393,6 +402,10 @@ async function askAI(from, userText) {
 
   const lang = LANGS.includes(parsed.language) ? parsed.language : undefined;
 
+  // How the customer feels: the AI's judgement, backed up by the word list above.
+  let mood = ["calm", "upset", "angry"].includes(parsed.mood) ? parsed.mood : "calm";
+  if (mood === "calm" && COMPLAINT_WORD.test(userText)) mood = "upset";
+
   // Only trust an order if the item name actually exists in the live catalog —
   // never let the AI invent an order for something that isn't real.
   let order = false;
@@ -442,7 +455,7 @@ async function askAI(from, userText) {
   );
   await saveHistory(from, past);
 
-  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply), order, orderItem, orderPrice, orderUncertain };
+  return { reply, image, video, lang, needsOwner: parsed.needs_owner === true || DEFERS_TO_OWNER(reply) || mood !== "calm", mood, order, orderItem, orderPrice, orderUncertain };
 }
 
 // ---------- WhatsApp sending ----------
@@ -651,6 +664,28 @@ async function recordOrder(customer, item, price) {
   }
 }
 
+// A customer is upset or angry: send an urgent alert (to the same numbers as the
+// regular "needs you" alerts) so the owner steps in quickly. Never throws.
+async function notifyUpsetCustomer(customer, message, botReply, mood) {
+  const body = [
+    mood === "angry" ? "🚨 Злой клиент, ответьте как можно скорее!" : "😟 Недовольный клиент, лучше ответить быстро",
+    `Клиент: +${customer}`,
+    `Сообщение: «${message}»`,
+    `Бот ответил: «${botReply}»`,
+    `Написать клиенту: https://wa.me/${customer}`,
+    "💬 Или ответьте на это сообщение (свайп), и я сам передам ваш ответ клиенту.",
+  ].join("\n");
+  for (const to of ALERT_TO) {
+    try {
+      const wamid = await sendText(to, body);
+      await rememberAlert(wamid, customer, message);
+      console.log(`Urgent (${mood}) alert sent to ${to} about customer ${customer}`);
+    } catch (err) {
+      console.error(`Could not send urgent alert to ${to}:`, err.message);
+    }
+  }
+}
+
 // Lowers the item's "Саны" by 1 in the sheet. Returns the new quantity, or null if
 // it couldn't be changed (no number in "Саны", item not found, sheet error). Never throws.
 async function decreaseStock(item) {
@@ -817,7 +852,7 @@ async function handleMessage(msg) {
 
   let counted = false; // so one customer message is never counted twice in the stats
   try {
-    const { reply, image, video, needsOwner, order, orderItem, orderPrice, orderUncertain } = await askAI(from, msg.text.body);
+    const { reply, image, video, needsOwner, mood, order, orderItem, orderPrice, orderUncertain } = await askAI(from, msg.text.body);
     if (reply) await sendText(from, reply);
     if (image) await sendImage(from, image);
     if (video) await sendVideo(from, video);
@@ -825,6 +860,7 @@ async function handleMessage(msg) {
     await bump("messages");
     await bump(needsOwner ? "escalated" : "answered");
     if (order) await bump("orders");
+    if (mood !== "calm") await bump("complaints");
     // TEMP DEBUG: log the AI's needs_owner decision for every message.
     // Remove this line once we've confirmed alerts are firing as expected.
     console.log(`needsOwner=${needsOwner} for message from ${from}: "${msg.text.body}"`);
@@ -832,7 +868,10 @@ async function handleMessage(msg) {
     // detected a purchase confirmation and, if so, whether the item matched
     // the real catalog. Remove once order alerts are confirmed working.
     console.log(`order=${order} item=${JSON.stringify(orderItem)} price=${JSON.stringify(orderPrice)} for message from ${from}: "${msg.text.body}"`);
-    if (needsOwner) await notifyOwner(from, msg.text.body, reply);
+    console.log(`mood=${mood} for message from ${from}`);
+    // An upset or angry customer gets the urgent alert instead of the regular one (never both)
+    if (mood !== "calm") await notifyUpsetCustomer(from, msg.text.body, reply, mood);
+    else if (needsOwner) await notifyOwner(from, msg.text.body, reply);
     if (order) await recordOrder(from, orderItem, orderPrice);
     else if (orderUncertain) await notifyPossibleOrder(from, msg.text.body, reply);
   } catch (err) {
