@@ -46,9 +46,9 @@ function buildSystemPrompt(rows) {
   return `You are the WhatsApp assistant for a small clothing shop. Answer customer questions warmly and briefly, like a real quick chat reply, not a formal essay. Only use the shop information and product data below; if something isn't covered by them, say you'll check with the owner and get back to them rather than guessing. Never infer availability, price, or color from similar products. Never mention that you are an AI.
 
 LANGUAGE: Customers write in Russian, Kyrgyz or English. Always reply in the language of the customer's LATEST message, and switch if they switch. A system line near the end of the conversation, "LANGUAGE FOR THIS REPLY", names that language: follow it exactly.
-- If the customer writes in English, reply entirely in English, with no Russian or Kyrgyz words. Greet with "Hello" or "Hi". Translate the catalog's item names, colors and descriptions into natural English (for example "Льняная рубашка — белая" becomes "white linen shirt"). The only exception is "order_item", which must still be copied exactly from the catalog.
+- If the customer writes in English, reply entirely in English, with no Russian or Kyrgyz words. Greet with "Hello" or "Hi". Translate the catalog's item names, colors and descriptions into natural English (for example "Зыгыр жейде — ак" becomes "white linen shirt"). The only exception is "order_item", which must still be copied exactly from the catalog.
 - Kyrgyz is a different language from Russian, even though both use Cyrillic. Kyrgyz messages often contain the letters ң, ө, ү or words like салам, саламатсызбы, канча, барбы, бар, жок, рахмат, кандай, эмне, керек, көрсөтүңүз. If the customer writes in Kyrgyz, reply entirely in Kyrgyz and never answer a Kyrgyz message in Russian. Greet with "Саламатсызбы" (or "Салам" if they were casual). In Kyrgyz replies, product names may stay exactly as written in the catalog.
-- If the customer writes in Russian, reply in Russian. Greet with "Здравствуйте" (or "Привет" if they were casual), never "Hi". Translate colors, materials and descriptive words into Russian (e.g. "oversized" becomes "оверсайз").
+- If the customer writes in Russian, reply in Russian. Greet with "Здравствуйте" (or "Привет" if they were casual), never "Hi". The catalog is written in Kyrgyz, so translate item names, colors, materials and descriptive words into natural Russian (e.g. "oversized" becomes "оверсайз").
 - In Russian and Kyrgyz replies use no Latin-alphabet words, except clothing size labels such as S, M, L, XL, which stay as they are.
 - Put the language you replied in into "language": "ky" for Kyrgyz, "ru" for Russian, "en" for English.
 
@@ -131,21 +131,28 @@ function envShop() {
   };
 }
 
-function rowToShop(r) {
-  const code = String(r.code || "").trim().toLowerCase();
+// The Shops tab's column names can be English or Kyrgyz:
+// code/код, name/аталышы, catalog_gid/каталог_gid, orders_gid/заказдар_gid,
+// owner_phone/ээсинин_телефону, alert_phone/эскертме_телефону, info/маалымат.
+function rowToShop(row) {
+  const get = (...names) => {
+    const found = names.find((n) => row[n] !== undefined);
+    return found === undefined ? "" : row[found];
+  };
+  const code = String(get("code", "код")).trim().toLowerCase();
   if (!code) return null;
-  const ownerIds = digitsList(r.owner_phone);
-  const alerts = digitsList(r.alert_phone);
+  const ownerIds = digitsList(get("owner_phone", "ээсинин_телефону"));
+  const alerts = digitsList(get("alert_phone", "эскертме_телефону"));
   const alertTo = alerts.length ? alerts : ownerIds;
   return {
     code,
-    name: String(r.name || code).trim(),
-    catalogGid: String(r.catalog_gid || "").trim() || "0",
-    ordersGid: String(r.orders_gid || "").trim(),
+    name: String(get("name", "аталышы") || code).trim(),
+    catalogGid: String(get("catalog_gid", "каталог_gid")).trim() || "0",
+    ordersGid: String(get("orders_gid", "заказдар_gid")).trim(),
     ownerIds,
     alertTo,
     orderAlertTo: alertTo,
-    info: String(r.info || "").trim(),
+    info: String(get("info", "маалымат")).trim(),
     isDefault: false,
   };
 }
@@ -242,9 +249,27 @@ async function fetchCatalog() {
       "Could not read the Google Sheet. Check SHEET_ID and that sharing is 'Anyone with the link: Viewer'."
     );
   }
-  const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+  const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true }).map(normalizeRow);
   catalogCaches.set(gid, { rows, at: Date.now() });
   return rows;
+}
+
+// The sheet's column names can be in Kyrgyz (Кийим, Сүрөт, Видео) or the older names
+// (Одежды, Photo, Video). The rest of the code always sees "Одежды", "Photo" and "Video".
+const COLUMN_NAMES = {
+  "Одежды": ["Одежды", "Кийим"],
+  Photo: ["Photo", "Сүрөт"],
+  Video: ["Video", "Видео"],
+};
+function normalizeRow(r) {
+  const out = { ...r };
+  for (const [usual, names] of Object.entries(COLUMN_NAMES)) {
+    const found = names.find((n) => out[n] !== undefined);
+    const value = found !== undefined ? out[found] : "";
+    for (const n of names) delete out[n];
+    out[usual] = value;
+  }
+  return out;
 }
 
 // ---------- Chat memory ----------
