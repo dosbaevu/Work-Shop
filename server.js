@@ -428,6 +428,7 @@ const OFF_CMD = /^(bot\s*off|pause\s*bot|бот\s*(выкл|стоп)|стоп\s
 const ON_CMD = /^(bot\s*on|resume\s*bot|бот\s*(вкл|включи))$/i;
 const STATUS_CMD = /^(bot\s*status|статус\s*бота)$/i;
 const STATS_CMD = /^(stats|bot\s*stats|статистика|статистика\s*бота)$/i;
+const LOWSTOCK_CMD = /^(low\s*stock|остатки|что\s*заканчивается|заканчивается)$/i;
 
 // Catalog-update commands, texted by the owner. Examples:
 //   "бежевый пиджак продан"        -> marks that item out of stock
@@ -572,6 +573,14 @@ async function handleMessage(msg) {
       await sendText(from, report);
       return;
     }
+    if (LOWSTOCK_CMD.test(t)) {
+      const { text } = await lowStockReport().catch((err) => {
+        console.error("Low stock report failed:", err.message);
+        return { text: "⚠️ Не удалось проверить остатки, попробуйте ещё раз." };
+      });
+      await sendText(from, text);
+      return;
+    }
     const catalogReply = await tryHandleCatalogCommand(t).catch((err) => {
       console.error("Catalog update failed:", err.message);
       return "⚠️ Не удалось обновить каталог, попробуйте ещё раз.";
@@ -665,6 +674,48 @@ async function notifyOwner(customer, question, botReply, note = "") {
   }
 }
 
+// ---------- Low stock + scheduled jobs ----------
+// Items whose quantity ("Саны" column) is at or below this number count as running low.
+const LOW_STOCK_THRESHOLD = Number(process.env.LOW_STOCK_THRESHOLD) || 2;
+
+// Returns { text, count }. count is 0 when everything is well stocked.
+async function lowStockReport() {
+  const rows = await fetchCatalog();
+  const low = rows
+    .map((r) => ({ name: String(r["Одежды"] || "").trim(), qty: String(r["Саны"] ?? "").trim() }))
+    .filter((r) => r.name && r.qty !== "" && Number.isFinite(Number(r.qty)) && Number(r.qty) <= LOW_STOCK_THRESHOLD)
+    .sort((a, b) => Number(a.qty) - Number(b.qty));
+  if (!low.length) return { text: "✅ Всё в наличии, ничего не заканчивается.", count: 0 };
+  const lines = low.map((r) => (Number(r.qty) === 0 ? `• ${r.name} — закончилось` : `• ${r.name} — осталось ${r.qty} шт.`));
+  return { text: `📦 Заканчивается товар (${LOW_STOCK_THRESHOLD} шт. и меньше):\n\n${lines.join("\n")}`, count: low.length };
+}
+
+// Text every owner/alert number. Never throws.
+async function alertOwners(text) {
+  for (const to of ALERT_TO) {
+    try {
+      await sendText(to, text);
+      console.log(`Scheduled message sent to ${to}`);
+    } catch (err) {
+      console.error(`Could not message ${to} (they must have messaged the shop number in the last 24 hours):`, err.message);
+    }
+  }
+}
+
+async function runScheduledTask(task) {
+  if (task === "lowstock") {
+    const { text, count } = await lowStockReport();
+    if (count) await alertOwners(text); // stay quiet when there is nothing to report
+    console.log(`Scheduled lowstock: ${count} item(s) low`);
+  } else if (task === "summary") {
+    const today = await loadDay(bishkekDay());
+    await alertOwners(`🌙 Итоги дня\n\n${statsBlock(today)}`);
+    console.log("Scheduled summary sent");
+  } else {
+    console.warn(`Unknown scheduled task: ${task}`);
+  }
+}
+
 // ---------- Web server ----------
 const app = express();
 app.use(
@@ -676,6 +727,17 @@ app.use(
 );
 
 app.get("/", (_req, res) => res.send("Aiperi Wear assistant is running"));
+
+// An outside timer (cron-job.org) calls this at set times, e.g.
+//   https://YOUR-APP.onrender.com/cron/lowstock?key=UPDATE_SECRET   (morning)
+//   https://YOUR-APP.onrender.com/cron/summary?key=UPDATE_SECRET    (evening)
+// Calling it also wakes the free Render server if it was asleep. We answer right
+// away and do the work afterwards so the timer never waits on a slow start.
+app.get("/cron/:task", (req, res) => {
+  if (!UPDATE_SECRET || req.query.key !== UPDATE_SECRET) return res.sendStatus(403);
+  res.status(200).send("ok");
+  runScheduledTask(req.params.task).catch((err) => console.error("Scheduled task failed:", err.message));
+});
 
 // Meta calls this once when you click "Verify and save"
 app.get("/webhook", (req, res) => {
