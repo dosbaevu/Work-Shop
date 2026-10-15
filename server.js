@@ -580,11 +580,13 @@ async function askAI(from, userText) {
       : [];
 
   // Which language to reply in, decided here (not left to the AI): the language of the
-  // customer's latest message; if that is unclear (e.g. just a shop code), the language
-  // we last used with them; for a brand-new chat, Russian.
+  // customer's latest message. A message that is ONLY a shop code ("adidas", typed in Latin
+  // letters) counts as English. Otherwise, if it is unclear, the language we last used
+  // with them; for a brand-new chat, Kyrgyz.
   const shopCodes = (await getShops()).map((s) => s.code);
   const lastLang = [...past].reverse().find((m) => m.lang)?.lang;
-  const target = detectLanguage(userText, shopCodes) || lastLang || (past.length === 0 ? "ky" : null);
+  const onlyShopCode = shopCodes.includes(String(userText || "").trim().toLowerCase().replace(/[^\p{L}\p{N}_]+/gu, ""));
+  const target = detectLanguage(userText, shopCodes) || (onlyShopCode ? "en" : null) || lastLang || (past.length === 0 ? "ky" : null);
   const langNote = target
     ? [
         {
